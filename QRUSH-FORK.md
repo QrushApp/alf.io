@@ -23,6 +23,12 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
   retrieveDetail hides ticket resources for PENDING tickets and buries UUIDs in URI templates.
   Re-evaluate replacement at every rebase gate.
 - Wave-2 additions: see share/Fable/ticket/wave-2-backlog.md in the qrush repo.
+- `src/test/resources/api/descriptor.json` — REGENERATED (the one non-additive change; upstream's
+  own sanctioned mechanism): `TestCheckRestApiStability` diffs the REST surface against this
+  snapshot, so adding P1/P2 requires regenerating it (flip `updateDescriptor=true` in the test,
+  run `./gradlew test --tests '*CheckRestApiStability*' -Dpgsql.version=16`, flip back, commit the
+  json). Re-regenerate after EVERY new fork endpoint and at every rebase gate. The regen rewrites
+  the whole file (serialization churn) — the comparator is semantic, only real API diffs fail CI.
 
 ## Rebase gate (next: 2.0-M6)
 1. pg_dump the production DB (Flyway is forward-only) — qrush_tickets runbook.
