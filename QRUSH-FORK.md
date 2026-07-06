@@ -1,0 +1,43 @@
+# qrush fork policy
+
+Fork of alfio-event/alf.io. Working branch: qrush/2.0-M5-2606, cut from tag 2.0-M5-2606.
+Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workflows/qrush-build.yml).
+
+## Rules
+1. ADDITIVE ONLY. Patches are new files (controllers under alfio.controller.api.v1.admin, tests,
+   workflow, this doc). Never edit upstream files — no core managers, no security config, no SQL.
+   Gate: `git diff --name-only 2.0-M5-2606..HEAD` lists fork-owned files only.
+2. Pinned tag. The branch tracks tag 2.0-M5-2606 until a deliberate rebase. Never merge upstream
+   main ad hoc.
+3. Security model: new endpoints live under /api/v1/admin/** (auto hasRole(API_CLIENT) via
+   APITokenAuthWebSecurity) and MUST call accessService.checkReservationOwnership /
+   checkEventOwnership as their FIRST statement. AdminReservationManager does not re-check
+   ownership — the controller guard is the entire boundary.
+4. alf.io money is non-authoritative (topology B): fork endpoints always pass
+   refund=false, notify=false, creditNoteRequested=false.
+
+## Patch inventory (wave 1)
+- P1 POST /api/v1/admin/reservation/{eventSlug}/{reservationId}/refund-void — full/partial void.
+- P2 GET  /api/v1/admin/reservation/{eventSlug}/{reservationId} — status + ticket public UUIDs.
+  Overlaps upstream ReservationApiV1Controller#retrieveDetail (exists at the tag); kept because
+  retrieveDetail hides ticket resources for PENDING tickets and buries UUIDs in URI templates.
+  Re-evaluate replacement at every rebase gate.
+- Wave-2 additions: see share/Fable/ticket/wave-2-backlog.md in the qrush repo.
+
+## Rebase gate (next: 2.0-M6)
+1. pg_dump the production DB (Flyway is forward-only) — qrush_tickets runbook.
+2. New branch qrush/<new-tag> from the new tag; cherry-pick fork-owned files (additive => trivial).
+3. MANDATORY: full run of QrushReservationApiV1ControllerTest — the cross-org tests
+   (crossOrgKeyCannotRead/Void*, unknownSlug*) must pass unmodified. A guard-signature change
+   upstream fails compilation loudly; a behavior change fails these tests. Never relax them.
+4. Re-check the P2 overlap decision, CI pgsql matrix version, and Dockerfile drift.
+   Also EDIT `.github/workflows/qrush-build.yml` image tags: they are hardcoded to
+   `qrush-2.0-M5-2606`, so a `qrush/2.0-M6` branch would silently republish the -2606
+   tags unless you bump them to `qrush-<new-tag>` here.
+5. Build + push the new image tag; qrush_tickets compose bump is a separate, deliberate deploy.
+
+## Upstream PR strategy
+- refund-void (P1) is the upstreamable patch: the org-key surface has no headless cancel/void at
+  the tag (all refund/cancel endpoints are admin-session). Offer it upstream after the pilot
+  proves the API shape; carrying it in-tree is cheap either way.
+- P2 read: NOT offered upstream (near-duplicate of retrieveDetail); private convenience only.

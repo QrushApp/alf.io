@@ -1,0 +1,47 @@
+name: qrush build
+
+on:
+  push:
+    branches: ['qrush/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
+          restore-keys: ${{ runner.os }}-gradle-
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+      # runs the FULL suite (incl. QrushReservationApiV1ControllerTest; Testcontainers uses the runner's Docker)
+      # and assembles build/dockerize/{Dockerfile,alfio-boot.jar}
+      - name: Build, test, assemble docker context
+        run: ./gradlew build distribution -Dpgsql.version=16
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./build/dockerize
+          # amd64 only: the target VPS (CX33) is x86; add linux/arm64 later if a dev-Mac deploy target appears
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606
+            ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606-${{ github.sha }}
