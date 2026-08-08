@@ -16,13 +16,18 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
 4. alf.io money is non-authoritative (topology B): fork endpoints always pass
    refund=false, notify=false, creditNoteRequested=false.
 
-## Patch inventory (wave 1)
+## Patch inventory
 - P1 POST /api/v1/admin/reservation/{eventSlug}/{reservationId}/refund-void — full/partial void.
 - P2 GET  /api/v1/admin/reservation/{eventSlug}/{reservationId} — status + ticket public UUIDs.
   Overlaps upstream ReservationApiV1Controller#retrieveDetail (exists at the tag); kept because
   retrieveDetail hides ticket resources for PENDING tickets and buries UUIDs in URI templates.
   Re-evaluate replacement at every rebase gate.
-- Wave-2 additions: see share/Fable/ticket/wave-2-backlog.md in the qrush repo.
+- P3 GET  /api/v1/admin/event/{slug}/qrush-attendees (QrushEventAttendeesApiV1Controller, wave 2) —
+  byte-compatible twin of upstream download-attendees whose additional-field values lookup is
+  status-agnostic (findAllValuesByTicketIds), so CHECKED_IN/TO_BE_PAID tickets keep their
+  Ticketnummer where upstream fetches ACQUIRED-only. Plain read: the refund=false/notify=false
+  rule above applies to the reservation-action endpoints, not here.
+- Further wave-2 candidates: see share/Fable/ticket/wave-2-backlog.md in the qrush repo.
 - `src/test/resources/api/descriptor.json` — REGENERATED (the one non-additive change; upstream's
   own sanctioned mechanism): `TestCheckRestApiStability` diffs the REST surface against this
   snapshot, so adding P1/P2 requires regenerating it (flip `updateDescriptor=true` in the test,
@@ -33,9 +38,11 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
 ## Rebase gate (next: 2.0-M6)
 1. pg_dump the production DB (Flyway is forward-only) — qrush_tickets runbook.
 2. New branch qrush/<new-tag> from the new tag; cherry-pick fork-owned files (additive => trivial).
-3. MANDATORY: full run of QrushReservationApiV1ControllerTest — the cross-org tests
-   (crossOrgKeyCannotRead/Void*, unknownSlug*) must pass unmodified. A guard-signature change
-   upstream fails compilation loudly; a behavior change fails these tests. Never relax them.
+3. MANDATORY: full run of QrushReservationApiV1ControllerTest AND
+   QrushEventAttendeesApiV1ControllerTest — the cross-org tests
+   (crossOrgKeyCannotRead/Void*, unknownSlug*, crossOrgKeyCannotReadForeignAttendees) must pass
+   unmodified. A guard-signature change upstream fails compilation loudly; a behavior change
+   fails these tests. Never relax them.
 4. Re-check the P2 overlap decision, CI pgsql matrix version, and Dockerfile drift.
    Also EDIT `.github/workflows/qrush-build.yml` image tags: they are hardcoded to
    `qrush-2.0-M5-2606`, so a `qrush/2.0-M6` branch would silently republish the -2606
