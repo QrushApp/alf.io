@@ -188,6 +188,76 @@ class QrushReservationApiV1ControllerTest {
     }
 
     @Test
+    void getReservationReturnsPerTicketDetail() {
+        var reservationId = createConfirmedReservation(orgAKey, 2);
+        var rowsByPublicUuid = ticketRepository.findTicketsInReservation(reservationId).stream()
+            .collect(java.util.stream.Collectors.toMap(t -> t.getPublicUuid().toString(), t -> t));
+
+        var body = Objects.requireNonNull(controller.getReservation(event.getShortName(), reservationId, orgAKey).getBody());
+
+        assertEquals(2, body.tickets().size());
+        for (var detail : body.tickets()) {
+            var row = Objects.requireNonNull(rowsByPublicUuid.get(detail.publicUuid()));
+            assertTrue(detail.id() > 0);
+            assertEquals(row.getId(), detail.id());
+            assertEquals(row.getUuid(), detail.uuid());
+            assertNotEquals(detail.publicUuid(), detail.uuid());
+            assertEquals(DEFAULT_CATEGORY_NAME, detail.categoryName());
+            assertFalse(detail.checkedIn());
+            // upstream reserveTickets writes the attendee's first/last name + email onto the ticket row
+            assertTrue(detail.assigned());
+            assertEquals("firstName lastName", detail.fullName());
+        }
+    }
+
+    @Test
+    void getReservationReportsUnassignedTickets() {
+        var reservationId = createConfirmedUnassignedReservation(orgAKey, 2);
+
+        var body = Objects.requireNonNull(controller.getReservation(event.getShortName(), reservationId, orgAKey).getBody());
+
+        assertEquals("COMPLETE", body.status());
+        assertEquals(2, body.tickets().size());
+        for (var detail : body.tickets()) {
+            assertFalse(detail.assigned());
+            assertTrue(org.apache.commons.lang3.StringUtils.isBlank(detail.fullName()));
+            assertEquals(DEFAULT_CATEGORY_NAME, detail.categoryName());
+        }
+    }
+
+    @Test
+    void getReservationReportsCheckedInTickets() {
+        var reservationId = createConfirmedReservation(orgAKey, 1);
+        ticketRepository.updateTicketsStatusWithReservationId(reservationId,
+            alfio.model.Ticket.TicketStatus.CHECKED_IN.name());
+
+        var body = Objects.requireNonNull(controller.getReservation(event.getShortName(), reservationId, orgAKey).getBody());
+
+        assertEquals(1, body.tickets().size());
+        assertTrue(body.tickets().get(0).checkedIn());
+        assertEquals("CHECKED_IN", body.tickets().get(0).status());
+    }
+
+    /** Tickets without holder data, the way qrush creates them: a buyer plus a bare quantity. */
+    private String createConfirmedUnassignedReservation(APITokenAuthentication principal, int ticketCount) {
+        var category = ticketCategoryRepository.findFirstWithAvailableTickets(event.getId()).orElseThrow();
+        var buyer = new ReservationUser(null, "Buyer", "McBuyer", "buyer@example.org", null);
+        var creationRequest = new TicketReservationCreationRequest(
+            List.of(new AttendeesByCategory(category.getId(), ticketCount, List.of(), null)),
+            List.of(), null, buyer, null, "en", null, null);
+        var created = upstreamController.createTicketsReservation(event.getShortName(), creationRequest, principal);
+        assertTrue(created.getStatusCode().is2xxSuccessful());
+        var reservationId = Objects.requireNonNull(Objects.requireNonNull(created.getBody()).id());
+        var confirmation = new ReservationConfirmationRequest(
+            new TransactionDetails("TRID", new BigDecimal("100.00"),
+                LocalDateTime.now(clockProvider.getClock()), "notes", PaymentProxy.ON_SITE),
+            new Notification(true, true), null);
+        assertTrue(upstreamController.confirmReservation(reservationId, confirmation, principal)
+            .getStatusCode().is2xxSuccessful());
+        return reservationId;
+    }
+
+    @Test
     void getReservationExposesPendingTicketsBeforeFinalize() {
         // retrieveDetail (upstream) hides resources for PENDING tickets — our lean read must not
         var reservationId = createReservation(orgAKey, 1);

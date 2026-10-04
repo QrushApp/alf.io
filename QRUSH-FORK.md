@@ -18,8 +18,10 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
 
 ## Patch inventory
 - P1 POST /api/v1/admin/reservation/{eventSlug}/{reservationId}/refund-void — full/partial void.
-- P2 GET  /api/v1/admin/reservation/{eventSlug}/{reservationId} — status + ticket public UUIDs.
-  Overlaps upstream ReservationApiV1Controller#retrieveDetail (exists at the tag); kept because
+- P2 GET  /api/v1/admin/reservation/{eventSlug}/{reservationId} — status + per-ticket detail
+  (numeric id, internal and public uuid, assigned, checked-in, holder name, category id and name).
+  The internal uuid is the check-in identifier, so this endpoint stays org-key only and its answer
+  is never forwarded to a client. Overlaps upstream ReservationApiV1Controller#retrieveDetail (exists at the tag); kept because
   retrieveDetail hides ticket resources for PENDING tickets and buries UUIDs in URI templates.
   Re-evaluate replacement at every rebase gate.
 - P3 GET  /api/v1/admin/event/{slug}/qrush-attendees (QrushEventAttendeesApiV1Controller, wave 2) —

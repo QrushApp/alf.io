@@ -21,7 +21,9 @@ import alfio.manager.AdminReservationManager;
 import alfio.manager.TicketReservationManager;
 import alfio.manager.support.IncompatibleStateException;
 import alfio.model.PurchaseContext.PurchaseContextType;
+import alfio.model.TicketCategory;
 import alfio.model.TicketReservation.TicketReservationStatus;
+import alfio.repository.TicketCategoryRepository;
 import alfio.repository.TicketRepository;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -33,6 +35,8 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.security.Principal;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -50,15 +54,18 @@ public class QrushReservationApiV1Controller {
     private final TicketReservationManager ticketReservationManager;
     private final AdminReservationManager adminReservationManager;
     private final TicketRepository ticketRepository;
+    private final TicketCategoryRepository ticketCategoryRepository;
 
     public QrushReservationApiV1Controller(AccessService accessService,
                                            TicketReservationManager ticketReservationManager,
                                            AdminReservationManager adminReservationManager,
-                                           TicketRepository ticketRepository) {
+                                           TicketRepository ticketRepository,
+                                           TicketCategoryRepository ticketCategoryRepository) {
         this.accessService = accessService;
         this.ticketReservationManager = ticketReservationManager;
         this.adminReservationManager = adminReservationManager;
         this.ticketRepository = ticketRepository;
+        this.ticketCategoryRepository = ticketCategoryRepository;
     }
 
     @GetMapping("/{eventSlug}/{reservationId}")
@@ -68,8 +75,13 @@ public class QrushReservationApiV1Controller {
         accessService.checkReservationOwnership(principal, PurchaseContextType.event, eventSlug, reservationId);
         // guaranteed to exist by the check above
         var reservation = ticketReservationManager.findById(reservationId).orElseThrow();
+        // one query for every category name in the reservation, not one per ticket
+        Map<Integer, String> categoryNames = ticketCategoryRepository.findCategoriesInReservation(reservationId).stream()
+            .collect(Collectors.toMap(TicketCategory::getId, TicketCategory::getName, (a, b) -> a));
         var tickets = ticketRepository.findTicketsInReservation(reservationId).stream()
-            .map(t -> new QrushTicketDetail(t.getPublicUuid().toString(), t.getCategoryId(), t.getStatus().name()))
+            .map(t -> new QrushTicketDetail(t.getPublicUuid().toString(), t.getCategoryId(), t.getStatus().name(),
+                t.getId(), t.getUuid(), t.getAssigned(), t.isCheckedIn(), t.getFullName(),
+                Objects.requireNonNullElse(categoryNames.get(t.getCategoryId()), "")))
             .toList();
         return ResponseEntity.ok(new QrushReservationDetail(reservationId, reservation.getStatus().name(), tickets));
     }
@@ -129,7 +141,10 @@ public class QrushReservationApiV1Controller {
         return ResponseEntity.ok(RefundVoidResponse.voided(status));
     }
 
-    public record QrushTicketDetail(String publicUuid, int categoryId, String status) {}
+    /** uuid is the internal check-in identifier: this answer stays org-key only, never forwarded to a client. */
+    public record QrushTicketDetail(String publicUuid, int categoryId, String status,
+                                    int id, String uuid, boolean assigned, boolean checkedIn,
+                                    String fullName, String categoryName) {}
 
     public record QrushReservationDetail(String reservationId, String status, List<QrushTicketDetail> tickets) {}
 
