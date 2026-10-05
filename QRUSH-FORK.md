@@ -36,6 +36,9 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
   run `./gradlew test --tests '*CheckRestApiStability*' -Dpgsql.version=16`, flip back, commit the
   json). Re-regenerate after EVERY new fork endpoint and at every rebase gate. The regen rewrites
   the whole file (serialization churn) — the comparator is semantic, only real API diffs fail CI.
+- `src/test/java/alfio/BaseTestConfiguration.java` — stripe-mock pinned to `v0.202.0` (test infra
+  only): `latest` moved to v0.203.0 on 2026-08-26 and rejects stripe-java 25.5.0's requests, which
+  failed four upstream Stripe integration tests in CI on 2026-10-05. Re-check the pin at every rebase gate.
 
 ## Rebase gate (next: 2.0-M6)
 1. pg_dump the production DB (Flyway is forward-only) — qrush_tickets runbook.

@@ -141,7 +141,8 @@ public class BaseTestConfiguration {
     @PostConstruct
     public void initStripeMock() {
         if (stripeMock == null) {
-            stripeMock = new GenericContainer<>("stripe/stripe-mock:latest")
+            // Pinned: stripe-mock >= v0.203.0 rejects what stripe-java 25.5.0 sends ("additional properties are not allowed").
+            stripeMock = new GenericContainer<>("stripe/stripe-mock:v0.202.0")
                 .withExposedPorts(12111, 12112);
             stripeMock.start();
             if ("true".equals(System.getenv().get("TESTCONTAINERS_RYUK_DISABLED"))) {
