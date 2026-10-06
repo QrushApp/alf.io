@@ -18,6 +18,7 @@ package alfio.controller.api.v1.admin;
 
 import alfio.manager.AccessService;
 import alfio.manager.AdminReservationManager;
+import alfio.manager.EventManager;
 import alfio.manager.TicketReservationManager;
 import alfio.manager.support.IncompatibleStateException;
 import alfio.model.PurchaseContext.PurchaseContextType;
@@ -25,6 +26,8 @@ import alfio.model.TicketCategory;
 import alfio.model.TicketReservation.TicketReservationStatus;
 import alfio.repository.TicketCategoryRepository;
 import alfio.repository.TicketRepository;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import org.apache.commons.codec.digest.DigestUtils;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -55,17 +58,20 @@ public class QrushReservationApiV1Controller {
     private final AdminReservationManager adminReservationManager;
     private final TicketRepository ticketRepository;
     private final TicketCategoryRepository ticketCategoryRepository;
+    private final EventManager eventManager;
 
     public QrushReservationApiV1Controller(AccessService accessService,
                                            TicketReservationManager ticketReservationManager,
                                            AdminReservationManager adminReservationManager,
                                            TicketRepository ticketRepository,
-                                           TicketCategoryRepository ticketCategoryRepository) {
+                                           TicketCategoryRepository ticketCategoryRepository,
+                                           EventManager eventManager) {
         this.accessService = accessService;
         this.ticketReservationManager = ticketReservationManager;
         this.adminReservationManager = adminReservationManager;
         this.ticketRepository = ticketRepository;
         this.ticketCategoryRepository = ticketCategoryRepository;
+        this.eventManager = eventManager;
     }
 
     @GetMapping("/{eventSlug}/{reservationId}")
@@ -75,13 +81,18 @@ public class QrushReservationApiV1Controller {
         accessService.checkReservationOwnership(principal, PurchaseContextType.event, eventSlug, reservationId);
         // guaranteed to exist by the check above
         var reservation = ticketReservationManager.findById(reservationId).orElseThrow();
+        var event = eventManager.getSingleEvent(eventSlug, principal.getName());
         // one query for every category name in the reservation, not one per ticket
         Map<Integer, String> categoryNames = ticketCategoryRepository.findCategoriesInReservation(reservationId).stream()
             .collect(Collectors.toMap(TicketCategory::getId, TicketCategory::getName, (a, b) -> a));
         var tickets = ticketRepository.findTicketsInReservation(reservationId).stream()
             .map(t -> new QrushTicketDetail(t.getPublicUuid().toString(), t.getCategoryId(), t.getStatus().name(),
                 t.getId(), t.getUuid(), t.getAssigned(), t.isCheckedIn(), t.getFullName(),
-                Objects.requireNonNullElse(categoryNames.get(t.getCategoryId()), "")))
+                Objects.requireNonNullElse(categoryNames.get(t.getCategoryId()), ""),
+                // hmacTicketInfo needs a holder: unassigned tickets carry no QR signature
+                t.getAssigned()
+                    ? DigestUtils.sha256Hex(t.hmacTicketInfo(event.getPrivateKey(), event.supportsQRCodeCaseInsensitive()))
+                    : null))
             .toList();
         return ResponseEntity.ok(new QrushReservationDetail(reservationId, reservation.getStatus().name(), tickets));
     }
@@ -144,7 +155,8 @@ public class QrushReservationApiV1Controller {
     /** uuid is the internal check-in identifier: this answer stays org-key only, never forwarded to a client. */
     public record QrushTicketDetail(String publicUuid, int categoryId, String status,
                                     int id, String uuid, boolean assigned, boolean checkedIn,
-                                    String fullName, String categoryName) {}
+                                    String fullName, String categoryName,
+                                    @JsonInclude(JsonInclude.Include.NON_NULL) String signatureHash) {}
 
     public record QrushReservationDetail(String reservationId, String status, List<QrushTicketDetail> tickets) {}
 

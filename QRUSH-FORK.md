@@ -29,6 +29,7 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
   status-agnostic (findAllValuesByTicketIds), so CHECKED_IN/TO_BE_PAID tickets keep their
   Ticketnummer where upstream fetches ACQUIRED-only. Plain read: the refund=false/notify=false
   rule above applies to the reservation-action endpoints, not here.
+- P4 POST /api/v1/admin/event/{slug}/qrush-ticket-signatures (QrushEventAttendeesApiV1Controller, team-test) — the door list's sha256 of each ticket's QR signature, the offline check-in key, which upstream returns only encrypted and one id at a time; plus signatureHash on P2's ticket detail
 - Further wave-2 candidates: see share/Fable/ticket/wave-2-backlog.md in the qrush repo.
 - `src/test/resources/api/descriptor.json` — REGENERATED (the one non-additive change; upstream's
   own sanctioned mechanism): `TestCheckRestApiStability` diffs the REST surface against this
@@ -45,7 +46,8 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
 2. New branch qrush/<new-tag> from the new tag; cherry-pick fork-owned files (additive => trivial).
 3. MANDATORY: full run of QrushReservationApiV1ControllerTest AND
    QrushEventAttendeesApiV1ControllerTest — the cross-org tests
-   (crossOrgKeyCannotRead/Void*, unknownSlug*, crossOrgKeyCannotReadForeignAttendees) must pass
+   (crossOrgKeyCannotRead/Void*, unknownSlug*, crossOrgKeyCannotReadForeignAttendees,
+   crossOrgKeyCannotReadForeignSignatures) must pass
    unmodified. A guard-signature change upstream fails compilation loudly; a behavior change
    fails these tests. Never relax them.
 4. Re-check the P2 overlap decision, CI pgsql matrix version, and Dockerfile drift.

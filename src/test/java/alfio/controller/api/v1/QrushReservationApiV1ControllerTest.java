@@ -50,6 +50,8 @@ import alfio.repository.user.OrganizationRepository;
 import alfio.test.util.AlfioIntegrationTest;
 import alfio.test.util.IntegrationTestUtil;
 import alfio.util.ClockProvider;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -92,6 +94,7 @@ class QrushReservationApiV1ControllerTest {
     @Autowired private ReservationApiV1Controller upstreamController;
     @Autowired private QrushReservationApiV1Controller controller;
     @Autowired private AuthorityRepository authorityRepository;
+    @Autowired private ObjectMapper objectMapper;
 
     private Event event;
     private APITokenAuthentication orgAKey;
@@ -255,6 +258,43 @@ class QrushReservationApiV1ControllerTest {
         assertTrue(upstreamController.confirmReservation(reservationId, confirmation, principal)
             .getStatusCode().is2xxSuccessful());
         return reservationId;
+    }
+
+    @Test
+    void p4_1_assignedTicketsCarryTheirSignatureHash() {
+        var reservationId = createConfirmedReservation(orgAKey, 2);
+        var reread = eventRepository.findById(event.getId());
+        var rowsById = ticketRepository.findTicketsInReservation(reservationId).stream()
+            .collect(java.util.stream.Collectors.toMap(alfio.model.Ticket::getId, t -> t));
+
+        var body = Objects.requireNonNull(controller.getReservation(event.getShortName(), reservationId, orgAKey).getBody());
+
+        assertEquals(2, body.tickets().size());
+        for (var detail : body.tickets()) {
+            var row = Objects.requireNonNull(rowsById.get(detail.id()));
+            var expected = DigestUtils.sha256Hex(row.hmacTicketInfo(reread.getPrivateKey(), reread.supportsQRCodeCaseInsensitive()));
+            assertEquals(expected, detail.signatureHash());
+        }
+    }
+
+    @Test
+    void p4_2_unassignedTicketsHaveNoSignatureHash() {
+        var reservationId = createConfirmedUnassignedReservation(orgAKey, 2);
+
+        var body = Objects.requireNonNull(controller.getReservation(event.getShortName(), reservationId, orgAKey).getBody());
+
+        assertEquals(2, body.tickets().size());
+        assertTrue(body.tickets().stream().allMatch(t -> t.signatureHash() == null));
+    }
+
+    @Test
+    void p4_3_unassignedTicketJsonOmitsSignatureHashKey() throws Exception {
+        var reservationId = createConfirmedUnassignedReservation(orgAKey, 2);
+        var body = Objects.requireNonNull(controller.getReservation(event.getShortName(), reservationId, orgAKey).getBody());
+
+        var json = objectMapper.readTree(objectMapper.writeValueAsString(body.tickets().get(0)));
+
+        assertFalse(json.has("signatureHash"));
     }
 
     @Test

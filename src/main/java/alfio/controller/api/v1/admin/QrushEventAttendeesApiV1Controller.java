@@ -19,12 +19,17 @@ package alfio.controller.api.v1.admin;
 import alfio.manager.AccessService;
 import alfio.manager.EventManager;
 import alfio.manager.PurchaseContextFieldManager;
+import alfio.model.FullTicketInfo;
 import alfio.model.PurchaseContextFieldValue;
 import alfio.model.api.v1.admin.DownloadedAttendeeData;
 import alfio.model.api.v1.admin.DownloadedAttendeesByCategory;
+import alfio.repository.TicketRepository;
+import org.apache.commons.codec.digest.DigestUtils;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -39,21 +44,27 @@ import java.util.stream.Collectors;
  * accessService.checkEventOwnership is the org-isolation boundary.
  * Same payload as EventApiV1Controller#downloadAttendees (identical records, byte-compatible for
  * the qrush CF parser); the only difference is the status-agnostic additional-values lookup.
+ * P4 qrush-ticket-signatures: sha256 of each assigned ticket's QR signature, the offline check-in key.
  */
 @RestController
 @RequestMapping("/api/v1/admin/event")
 public class QrushEventAttendeesApiV1Controller {
 
+    private static final int MAX_SIGNATURE_IDS = 200;
+
     private final AccessService accessService;
     private final EventManager eventManager;
     private final PurchaseContextFieldManager purchaseContextFieldManager;
+    private final TicketRepository ticketRepository;
 
     public QrushEventAttendeesApiV1Controller(AccessService accessService,
                                               EventManager eventManager,
-                                              PurchaseContextFieldManager purchaseContextFieldManager) {
+                                              PurchaseContextFieldManager purchaseContextFieldManager,
+                                              TicketRepository ticketRepository) {
         this.accessService = accessService;
         this.eventManager = eventManager;
         this.purchaseContextFieldManager = purchaseContextFieldManager;
+        this.ticketRepository = ticketRepository;
     }
 
     @GetMapping("/{slug}/qrush-attendees")
@@ -94,4 +105,26 @@ public class QrushEventAttendeesApiV1Controller {
                 return new DownloadedAttendeesByCategory(category.getId(), downloadedAttendeesData);
             }).toList());
     }
+
+    @PostMapping("/{slug}/qrush-ticket-signatures")
+    public ResponseEntity<List<QrushTicketSignature>> qrushTicketSignatures(@PathVariable String slug,
+                                                                            @RequestBody List<Integer> ids,
+                                                                            Principal user) {
+        accessService.checkEventOwnership(user, slug);
+        if (ids.size() > MAX_SIGNATURE_IDS) {
+            return ResponseEntity.badRequest().build();
+        }
+        if (ids.isEmpty()) {
+            return ResponseEntity.ok(List.of());
+        }
+        var event = eventManager.getSingleEvent(slug, user.getName());
+        // event-scoped and ordered by id; only tickets with a holder carry a QR signature
+        return ResponseEntity.ok(ticketRepository.findAllFullTicketInfoAssignedByEventId(event.getId(), ids).stream()
+            .filter(FullTicketInfo::getAssigned)
+            .map(t -> new QrushTicketSignature(t.getId(),
+                DigestUtils.sha256Hex(t.hmacTicketInfo(event.getPrivateKey(), event.supportsQRCodeCaseInsensitive()))))
+            .toList());
+    }
+
+    public record QrushTicketSignature(int id, String signatureHash) {}
 }

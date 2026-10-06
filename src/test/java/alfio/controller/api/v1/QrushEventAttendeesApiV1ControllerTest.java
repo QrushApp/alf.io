@@ -58,8 +58,10 @@ import alfio.test.util.AlfioIntegrationTest;
 import alfio.test.util.IntegrationTestUtil;
 import alfio.util.ClockProvider;
 import alfio.util.Json;
+import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
@@ -71,6 +73,8 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -284,5 +288,130 @@ class QrushEventAttendeesApiV1ControllerTest {
         // org B key on org B's own event still works -> the denial above is isolation, not a blanket failure
         assertTrue(controller.qrushAttendees(orgB.event().getShortName(), orgB.key())
             .getStatusCode().is2xxSuccessful());
+    }
+
+    /** Tickets without holder data, the way qrush creates them: a buyer plus a bare quantity. */
+    private String createConfirmedUnassignedReservation(APITokenAuthentication principal, int ticketCount) {
+        var category = ticketCategoryRepository.findFirstWithAvailableTickets(event.getId()).orElseThrow();
+        var buyer = new ReservationUser(null, "Buyer", "McBuyer", "buyer@example.org", null);
+        var creationRequest = new TicketReservationCreationRequest(
+            List.of(new AttendeesByCategory(category.getId(), ticketCount, List.of(), null)),
+            List.of(), null, buyer, null, "en", null, null);
+        var created = upstreamReservationController.createTicketsReservation(event.getShortName(), creationRequest, principal);
+        assertTrue(created.getStatusCode().is2xxSuccessful());
+        var reservationId = Objects.requireNonNull(Objects.requireNonNull(created.getBody()).id());
+        var confirmation = new ReservationConfirmationRequest(
+            new TransactionDetails("TRID", new BigDecimal("100.00"),
+                LocalDateTime.now(clockProvider.getClock()), "notes", PaymentProxy.ON_SITE),
+            new Notification(true, true), null);
+        assertTrue(upstreamReservationController.confirmReservation(reservationId, confirmation, principal)
+            .getStatusCode().is2xxSuccessful());
+        return reservationId;
+    }
+
+    /** Tickets A and B of org A's event, both assigned to attendees; A is the lower id. */
+    private List<Ticket> createAssignedTicketPair() {
+        var reservationId = createConfirmedReservation(List.of("QR-4001", "QR-4002"));
+        var tickets = ticketRepository.findTicketsInReservation(reservationId).stream()
+            .sorted(Comparator.comparingInt(Ticket::getId))
+            .toList();
+        assertEquals(2, tickets.size());
+        return tickets;
+    }
+
+    /** The offline check-in key, computed from the suite's own event re-read from the database. */
+    private String expectedSignatureHash(Ticket row) {
+        var reread = eventRepository.findById(event.getId());
+        return DigestUtils.sha256Hex(row.hmacTicketInfo(reread.getPrivateKey(), reread.supportsQRCodeCaseInsensitive()));
+    }
+
+    @Test
+    void p4_4_signaturesOrderedById() {
+        var pair = createAssignedTicketPair();
+        var a = pair.get(0);
+        var b = pair.get(1);
+
+        var response = controller.qrushTicketSignatures(event.getShortName(), List.of(b.getId(), a.getId()), orgAKey);
+
+        assertEquals(200, response.getStatusCode().value());
+        assertEquals(List.of(
+                new QrushEventAttendeesApiV1Controller.QrushTicketSignature(a.getId(), expectedSignatureHash(a)),
+                new QrushEventAttendeesApiV1Controller.QrushTicketSignature(b.getId(), expectedSignatureHash(b))),
+            response.getBody());
+    }
+
+    @Test
+    void p4_5_signaturesSkipUnassignedAndForeignTickets() {
+        var pair = createAssignedTicketPair();
+        var a = pair.get(0);
+        var b = pair.get(1);
+        var unassignedReservationId = createConfirmedUnassignedReservation(orgAKey, 1);
+        var unassignedId = ticketRepository.findTicketsInReservation(unassignedReservationId).get(0).getId();
+        var orgB = createForeignOrg();
+        addTicketNumberField(orgB.event());
+        var foreignReservationId = createReservation(orgB.event(), orgB.key(), List.of("QR-x"));
+        var foreignId = ticketRepository.findTicketsInReservation(foreignReservationId).get(0).getId();
+
+        var response = controller.qrushTicketSignatures(event.getShortName(),
+            List.of(a.getId(), b.getId(), unassignedId, foreignId), orgAKey);
+
+        assertEquals(200, response.getStatusCode().value());
+        assertEquals(List.of(
+                new QrushEventAttendeesApiV1Controller.QrushTicketSignature(a.getId(), expectedSignatureHash(a)),
+                new QrushEventAttendeesApiV1Controller.QrushTicketSignature(b.getId(), expectedSignatureHash(b))),
+            response.getBody());
+    }
+
+    @Test
+    void p4_6_moreThan200IdsIsRejected() {
+        var a = createAssignedTicketPair().get(0);
+
+        var response = controller.qrushTicketSignatures(event.getShortName(), Collections.nCopies(201, a.getId()), orgAKey);
+
+        assertEquals(400, response.getStatusCode().value());
+    }
+
+    @Test
+    void p4_7_emptyIdListAnswersEmptyList() {
+        var response = controller.qrushTicketSignatures(event.getShortName(), List.of(), orgAKey);
+
+        assertEquals(200, response.getStatusCode().value());
+        assertEquals(List.of(), response.getBody());
+    }
+
+    @Test
+    @DisplayName("P4.8 crossOrgKeyCannotReadForeignSignatures")
+    void crossOrgKeyCannotReadForeignSignatures() {
+        var pair = createAssignedTicketPair();
+        var ids = List.of(pair.get(0).getId(), pair.get(1).getId());
+        var orgB = createForeignOrg();
+
+        // org B key + org A slug -> denied, no hashes
+        assertThrows(AccessDeniedException.class,
+            () -> controller.qrushTicketSignatures(event.getShortName(), ids, orgB.key()));
+        // nonexistent slug -> AccessDenied (403 over HTTP), never a 404 that confirms existence
+        assertThrows(AccessDeniedException.class,
+            () -> controller.qrushTicketSignatures("does-not-exist", ids, orgB.key()));
+        // org B key on its own event with org A's ids -> allowed, but the event scope yields nothing
+        var own = controller.qrushTicketSignatures(orgB.event().getShortName(), ids, orgB.key());
+        assertEquals(200, own.getStatusCode().value());
+        assertEquals(List.of(), own.getBody());
+    }
+
+    @Test
+    void p4_9_foreignKeyOverCapIsDeniedNotRejected() {
+        var a = createAssignedTicketPair().get(0);
+        var orgB = createForeignOrg();
+
+        assertThrows(AccessDeniedException.class,
+            () -> controller.qrushTicketSignatures(event.getShortName(), Collections.nCopies(201, a.getId()), orgB.key()));
+    }
+
+    @Test
+    void p4_10_foreignKeyWithEmptyListIsDenied() {
+        var orgB = createForeignOrg();
+
+        assertThrows(AccessDeniedException.class,
+            () -> controller.qrushTicketSignatures(event.getShortName(), List.of(), orgB.key()));
     }
 }

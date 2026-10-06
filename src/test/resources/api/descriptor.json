@@ -5455,6 +5455,89 @@
         }
       }
     },
+    "/api/v1/admin/event/{slug}/qrush-ticket-signatures" : {
+      "post" : {
+        "tags" : [ "qrush-event-attendees-api-v-1-controller" ],
+        "operationId" : "qrushTicketSignatures",
+        "parameters" : [ {
+          "name" : "slug",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "type" : "array",
+                "items" : {
+                  "type" : "integer",
+                  "format" : "int32"
+                }
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "400" : {
+            "description" : "Bad Request",
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "type" : "string"
+                }
+              }
+            }
+          },
+          "401" : {
+            "description" : "Unauthorized",
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "type" : "string"
+                }
+              }
+            }
+          },
+          "403" : {
+            "description" : "Forbidden",
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "type" : "string"
+                }
+              }
+            }
+          },
+          "500" : {
+            "description" : "Internal Server Error",
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "type" : "string"
+                }
+              }
+            }
+          },
+          "200" : {
+            "description" : "OK",
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "type" : "array",
+                  "items" : {
+                    "$ref" : "#/components/schemas/QrushTicketSignature"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/admin/event/{slug}/generate-subscribers-tickets" : {
       "post" : {
         "tags" : [ "event-api-v-1-controller" ],
@@ -30487,6 +30570,18 @@
           }
         }
       },
+      "QrushTicketSignature" : {
+        "type" : "object",
+        "properties" : {
+          "id" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "signatureHash" : {
+            "type" : "string"
+          }
+        }
+      },
       "CategoryRequest" : {
         "type" : "object",
         "properties" : {
@@ -34062,6 +34157,28 @@
             "format" : "int32"
           },
           "status" : {
+            "type" : "string"
+          },
+          "id" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "uuid" : {
+            "type" : "string"
+          },
+          "assigned" : {
+            "type" : "boolean"
+          },
+          "checkedIn" : {
+            "type" : "boolean"
+          },
+          "fullName" : {
+            "type" : "string"
+          },
+          "categoryName" : {
+            "type" : "string"
+          },
+          "signatureHash" : {
             "type" : "string"
           }
         }
