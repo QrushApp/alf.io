@@ -160,6 +160,46 @@ class QrushPublicTicketAssignGuardTest {
     }
 
     @Test
+    @DisplayName("[T22.113] public ticket-assign PUT with an encoded letter in the ticket segment is refused with 403")
+    void t22_113_putWithEncodedTicketSegmentIsRefused() throws Exception {
+        var outcome = pass("PUT", "/api/v2/public/event/party-1/ticke%74/" + U);
+
+        assertRefused(outcome);
+    }
+
+    @Test
+    @DisplayName("[T22.114] public ticket-assign PUT with an encoded letter in the event segment is refused with 403")
+    void t22_114_putWithEncodedEventSegmentIsRefused() throws Exception {
+        var outcome = pass("PUT", "/api/v2/public/%65vent/party-1/ticket/" + U);
+
+        assertRefused(outcome);
+    }
+
+    @Test
+    @DisplayName("[T22.115] public ticket-assign PUT with an encoded letter and a trailing slash is refused with 403")
+    void t22_115_putWithEncodedSegmentAndTrailingSlashIsRefused() throws Exception {
+        var outcome = pass("PUT", "/api/v2/public/event/party-1/ticke%74/" + U + "/");
+
+        assertRefused(outcome);
+    }
+
+    @Test
+    @DisplayName("[T22.116] public ticket-assign PUT with a ;jsessionid matrix parameter is refused with 403")
+    void t22_116_putWithMatrixParameterIsRefused() throws Exception {
+        var outcome = pass("PUT", "/api/v2/public/event/party-1/ticket;jsessionid=x/" + U);
+
+        assertRefused(outcome);
+    }
+
+    @Test
+    @DisplayName("[T22.117] (pin) PUT of an unrelated public path passes through")
+    void t22_117_putOfUnrelatedPublicPathPassesThrough() throws Exception {
+        var outcome = pass("PUT", "/api/v2/public/event/party-1/reservation/" + U);
+
+        assertChainInvokedOnce(outcome);
+    }
+
+    @Test
     @DisplayName("[T22.108] (pin) GET of the public code.png passes through")
     void t22_108_getCodePngPassesThrough() throws Exception {
         var outcome = pass("GET", ASSIGN_PATH + "/code.png");

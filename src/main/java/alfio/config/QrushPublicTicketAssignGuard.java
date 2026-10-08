@@ -29,10 +29,13 @@ import org.springframework.boot.autoconfigure.security.SecurityProperties;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.server.PathContainer;
+import org.springframework.http.server.RequestPath;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.web.util.pattern.PathPattern;
+import org.springframework.web.util.pattern.PathPatternParser;
 
 import java.io.IOException;
-import java.util.regex.Pattern;
 
 /**
  * qrush fork patch P8 — additive-only, see QRUSH-FORK.md.
@@ -43,10 +46,8 @@ import java.util.regex.Pattern;
 @Configuration
 public class QrushPublicTicketAssignGuard {
 
-    private static final Pattern PUBLIC_TICKET_ASSIGN = Pattern.compile("^/api/v2/public/event/[^/]+/ticket/[^/]+/?$");
-
-    public QrushPublicTicketAssignGuard() {
-    }
+    private static final PathPattern PUBLIC_TICKET_ASSIGN =
+        PathPatternParser.defaultInstance.parse("/api/v2/public/event/{eventName}/ticket/{ticketIdentifier}");
 
     @Bean
     public FilterRegistrationBean<Filter> qrushPublicTicketAssignGuard() {
@@ -60,12 +61,15 @@ public class QrushPublicTicketAssignGuard {
         if (!"PUT".equals(request.getMethod())) {
             return false;
         }
-        var uri = request.getRequestURI();
-        var contextPath = request.getContextPath();
-        var path = contextPath != null && !contextPath.isEmpty() && uri.startsWith(contextPath)
-            ? uri.substring(contextPath.length())
-            : uri;
-        return PUBLIC_TICKET_ASSIGN.matcher(path).matches();
+        // match the path MVC routes: context stripped, each segment decoded, matrix parameters dropped
+        var path = RequestPath.parse(request.getRequestURI(), request.getContextPath()).pathWithinApplication();
+        if (PUBLIC_TICKET_ASSIGN.matches(path)) {
+            return true;
+        }
+        var elements = path.elements();
+        return !elements.isEmpty()
+            && elements.get(elements.size() - 1) instanceof PathContainer.Separator
+            && PUBLIC_TICKET_ASSIGN.matches(path.subPath(0, elements.size() - 1));
     }
 
     static boolean isOrgApiKey() {
