@@ -4,8 +4,9 @@ Fork of alfio-event/alf.io. Working branch: qrush/2.0-M5-2606, cut from tag 2.0-
 Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workflows/qrush-build.yml).
 
 ## Rules
-1. ADDITIVE ONLY. Patches are new files (controllers under alfio.controller.api.v1.admin, tests,
-   workflow, this doc). Never edit upstream files — no core managers, no security config, no SQL.
+1. ADDITIVE ONLY. Patches are new files (controllers under alfio.controller.api.v1.admin, one
+   fork-owned security filter under alfio.config (P8, assumes D23), tests, workflow, this doc).
+   Never edit upstream files — no core managers, no upstream security config, no SQL migrations.
    Gate: `git diff --name-only 2.0-M5-2606..HEAD` lists fork-owned files only.
 2. Pinned tag. The branch tracks tag 2.0-M5-2606 until a deliberate rebase. Never merge upstream
    main ad hoc.
@@ -30,6 +31,23 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
   Ticketnummer where upstream fetches ACQUIRED-only. Plain read: the refund=false/notify=false
   rule above applies to the reservation-action endpoints, not here.
 - P4 POST /api/v1/admin/event/{slug}/qrush-ticket-signatures (QrushEventAttendeesApiV1Controller, team-test) — the door list's sha256 of each ticket's QR signature, the offline check-in key, which upstream returns only encrypted and one id at a time; plus signatureHash on P2's ticket detail
+- P5 PUT  /api/v1/admin/event/{slug}/qrush-ticket/{publicUuid}/assign (QrushEventAttendeesApiV1Controller,
+  W15) — org-key twin of the public ticket-assign PUT: same UpdateTicketOwnerForm body and
+  ValidatedResponse answer (200 / 422), delegates to TicketHelper#assignTicket, whose fetchComplete
+  refuses a ticket of another event or outside a COMPLETE reservation (404). The qrush CF assigns here.
+- P6 POST /api/v1/admin/event/{slug}/qrush-ticket/{publicUuid}/reissue (QrushEventAttendeesApiV1Controller,
+  W15) — after a transfer: one UPDATE scoped to the ticket id gives it a fresh uuid AND public_uuid
+  and changes nothing else; only a ticket of that event in a COMPLETE reservation with status
+  ACQUIRED / TO_BE_PAID (404 otherwise, 400 for another status). Answers {publicUuid}. Not
+  idempotent: the CF recovers a lost answer through P2. Fork-owned SQL in the controller, no migration.
+- P7 GET  /api/v1/admin/event/{slug}/qrush-ticket/{publicUuid}/code.png (QrushEventAttendeesApiV1Controller,
+  W15) — the QR PNG of an assigned ticket of that event in a COMPLETE reservation,
+  `Cache-Control: no-store`; the source of the CF's holder-checked QR callable instead of the
+  public bearer-uuid code.png.
+- P8 `alfio.config.QrushPublicTicketAssignGuard` (W15, assumes D23) — servlet filter registered
+  after springSecurityFilterChain: `PUT /api/v2/public/event/{e}/ticket/{uuid}` answers 403 unless
+  the principal is an APITokenAuthentication holding ROLE_API_CLIENT. Upstream security config stays
+  untouched. Caddy refuses the same PUT once the CF assigns through P5.
 - Further wave-2 candidates: see share/Fable/ticket/wave-2-backlog.md in the qrush repo.
 - `src/test/resources/api/descriptor.json` — REGENERATED (the one non-additive change; upstream's
   own sanctioned mechanism): `TestCheckRestApiStability` diffs the REST surface against this
@@ -44,10 +62,12 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
 ## Rebase gate (next: 2.0-M6)
 1. pg_dump the production DB (Flyway is forward-only) — qrush_tickets runbook.
 2. New branch qrush/<new-tag> from the new tag; cherry-pick fork-owned files (additive => trivial).
-3. MANDATORY: full run of QrushReservationApiV1ControllerTest AND
-   QrushEventAttendeesApiV1ControllerTest — the cross-org tests
+3. MANDATORY: full run of QrushReservationApiV1ControllerTest,
+   QrushEventAttendeesApiV1ControllerTest AND QrushPublicTicketAssignGuardTest — the cross-org tests
    (crossOrgKeyCannotRead/Void*, unknownSlug*, crossOrgKeyCannotReadForeignAttendees,
-   crossOrgKeyCannotReadForeignSignatures) must pass
+   crossOrgKeyCannotReadForeignSignatures, crossOrgKeyCannotAssignForeignTicket,
+   crossOrgKeyCannotReissueForeignTicket, crossOrgKeyCannotReadForeignTicketQr) and the guard
+   suite must pass
    unmodified. A guard-signature change upstream fails compilation loudly; a behavior change
    fails these tests. Never relax them.
 4. Re-check the P2 overlap decision, CI pgsql matrix version, and Dockerfile drift.

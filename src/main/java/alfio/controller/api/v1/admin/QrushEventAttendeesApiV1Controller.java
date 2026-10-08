@@ -16,26 +16,43 @@
  */
 package alfio.controller.api.v1.admin;
 
+import alfio.controller.api.support.TicketHelper;
+import alfio.controller.form.UpdateTicketOwnerForm;
 import alfio.manager.AccessService;
 import alfio.manager.EventManager;
 import alfio.manager.PurchaseContextFieldManager;
+import alfio.manager.support.response.ValidatedResponse;
 import alfio.model.FullTicketInfo;
 import alfio.model.PurchaseContextFieldValue;
+import alfio.model.Ticket;
 import alfio.model.api.v1.admin.DownloadedAttendeeData;
 import alfio.model.api.v1.admin.DownloadedAttendeesByCategory;
 import alfio.repository.TicketRepository;
+import alfio.util.ImageUtil;
+import alfio.util.LocaleUtil;
 import org.apache.commons.codec.digest.DigestUtils;
+import org.springframework.http.CacheControl;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+import org.springframework.validation.BeanPropertyBindingResult;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.security.Principal;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 /**
@@ -45,26 +62,40 @@ import java.util.stream.Collectors;
  * Same payload as EventApiV1Controller#downloadAttendees (identical records, byte-compatible for
  * the qrush CF parser); the only difference is the status-agnostic additional-values lookup.
  * P4 qrush-ticket-signatures: sha256 of each assigned ticket's QR signature, the offline check-in key.
+ * P5 assign, P6 reissue, P7 code.png: org-key ticket routes that replace the public bearer-uuid ones.
  */
 @RestController
 @RequestMapping("/api/v1/admin/event")
 public class QrushEventAttendeesApiV1Controller {
 
     private static final int MAX_SIGNATURE_IDS = 200;
+    private static final Set<Ticket.TicketStatus> REISSUABLE_STATUSES = EnumSet.of(Ticket.TicketStatus.ACQUIRED, Ticket.TicketStatus.TO_BE_PAID);
+    private static final String FIND_COMPLETE_TICKET_ID = "select t.id from ticket t"
+        + " join tickets_reservation tr on tr.id = t.tickets_reservation_id"
+        + " where t.public_uuid = :publicUuid and t.event_id = :eventId and tr.status = 'COMPLETE'";
+    // rotates both uuids of one ticket; holder, status and reservation stay as they are
+    private static final String REISSUE_TICKET = "update ticket set uuid = :newUuid, public_uuid = :newPublicUuid"
+        + " where id = :ticketId and event_id = :eventId and status in ('ACQUIRED', 'TO_BE_PAID')";
 
     private final AccessService accessService;
     private final EventManager eventManager;
     private final PurchaseContextFieldManager purchaseContextFieldManager;
     private final TicketRepository ticketRepository;
+    private final TicketHelper ticketHelper;
+    private final NamedParameterJdbcTemplate jdbcTemplate;
 
     public QrushEventAttendeesApiV1Controller(AccessService accessService,
                                               EventManager eventManager,
                                               PurchaseContextFieldManager purchaseContextFieldManager,
-                                              TicketRepository ticketRepository) {
+                                              TicketRepository ticketRepository,
+                                              TicketHelper ticketHelper,
+                                              NamedParameterJdbcTemplate jdbcTemplate) {
         this.accessService = accessService;
         this.eventManager = eventManager;
         this.purchaseContextFieldManager = purchaseContextFieldManager;
         this.ticketRepository = ticketRepository;
+        this.ticketHelper = ticketHelper;
+        this.jdbcTemplate = jdbcTemplate;
     }
 
     @GetMapping("/{slug}/qrush-attendees")
@@ -126,5 +157,72 @@ public class QrushEventAttendeesApiV1Controller {
             .toList());
     }
 
+    @PutMapping("/{slug}/qrush-ticket/{publicUuid}/assign")
+    public ResponseEntity<ValidatedResponse<Boolean>> assign(@PathVariable String slug,
+                                                             @PathVariable UUID publicUuid,
+                                                             @RequestBody UpdateTicketOwnerForm form,
+                                                             Principal principal) {
+        accessService.checkEventOwnership(principal, slug);
+        var event = eventManager.getSingleEvent(slug, principal.getName());
+        var bindingResult = new BeanPropertyBindingResult(form, "updateTicketOwner");
+        var locale = LocaleUtil.forLanguageTag(form.getUserLanguage(), event);
+        // TicketHelper goes through fetchComplete: same event, COMPLETE reservation, else empty
+        return ticketHelper.assignTicket(slug, publicUuid, form, Optional.of(bindingResult), locale)
+            .map(r -> ResponseEntity.status(r.getLeft().isSuccess() ? HttpStatus.OK : HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new ValidatedResponse<>(r.getLeft(), r.getLeft().isSuccess())))
+            .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    @PostMapping("/{slug}/qrush-ticket/{publicUuid}/reissue")
+    public ResponseEntity<QrushReissuedTicket> reissue(@PathVariable String slug,
+                                                       @PathVariable UUID publicUuid,
+                                                       Principal principal) {
+        accessService.checkEventOwnership(principal, slug);
+        var event = eventManager.getSingleEvent(slug, principal.getName());
+        var ticket = findCompleteTicket(event.getId(), publicUuid);
+        if (ticket.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        if (!REISSUABLE_STATUSES.contains(ticket.get().getStatus())) {
+            return ResponseEntity.badRequest().build();
+        }
+        var newPublicUuid = UUID.randomUUID();
+        var params = new MapSqlParameterSource("ticketId", ticket.get().getId())
+            .addValue("eventId", event.getId())
+            .addValue("newUuid", UUID.randomUUID().toString())
+            .addValue("newPublicUuid", newPublicUuid);
+        if (jdbcTemplate.update(REISSUE_TICKET, params) != 1) {
+            return ResponseEntity.badRequest().build();
+        }
+        return ResponseEntity.ok(new QrushReissuedTicket(newPublicUuid.toString()));
+    }
+
+    @GetMapping("/{slug}/qrush-ticket/{publicUuid}/code.png")
+    public ResponseEntity<byte[]> qrCode(@PathVariable String slug,
+                                         @PathVariable UUID publicUuid,
+                                         Principal principal) {
+        accessService.checkEventOwnership(principal, slug);
+        var event = eventManager.getSingleEvent(slug, principal.getName());
+        return findCompleteTicket(event.getId(), publicUuid)
+            .filter(Ticket::getAssigned)
+            .map(t -> ResponseEntity.ok()
+                .contentType(MediaType.IMAGE_PNG)
+                .cacheControl(CacheControl.noStore())
+                .body(ImageUtil.createQRCode(t.ticketCode(event.getPrivateKey(), event.supportsQRCodeCaseInsensitive()))))
+            .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /** The ticket with this public uuid, only if it belongs to the event and sits in a COMPLETE reservation. */
+    private Optional<Ticket> findCompleteTicket(int eventId, UUID publicUuid) {
+        var ids = jdbcTemplate.queryForList(FIND_COMPLETE_TICKET_ID,
+            new MapSqlParameterSource("publicUuid", publicUuid).addValue("eventId", eventId), Integer.class);
+        if (ids.size() != 1) {
+            return Optional.empty();
+        }
+        return ticketRepository.findByIds(ids).stream().findFirst();
+    }
+
     public record QrushTicketSignature(int id, String signatureHash) {}
+
+    public record QrushReissuedTicket(String publicUuid) {}
 }
