@@ -49,8 +49,9 @@ public class QrushPublicTicketAssignGuard {
     private static final PathPattern PUBLIC_TICKET_ASSIGN =
         PathPatternParser.defaultInstance.parse("/api/v2/public/event/{eventName}/ticket/{ticketIdentifier}");
 
+    // a bean named like this @Configuration class collides with it at boot
     @Bean
-    public FilterRegistrationBean<Filter> qrushPublicTicketAssignGuard() {
+    public FilterRegistrationBean<Filter> qrushPublicTicketAssignGuardFilter() {
         Filter filter = QrushPublicTicketAssignGuard::guard;
         var registration = new FilterRegistrationBean<>(filter);
         registration.setOrder(SecurityProperties.DEFAULT_FILTER_ORDER + 1);

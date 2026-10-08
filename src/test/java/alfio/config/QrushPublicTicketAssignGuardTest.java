@@ -22,6 +22,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.security.SecurityProperties;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.context.annotation.ClassPathBeanDefinitionScanner;
+import org.springframework.core.type.filter.AssignableTypeFilter;
 import org.springframework.mock.web.MockFilterChain;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
@@ -39,9 +43,10 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * P8: the public ticket-assign PUT needs an authenticated org API key. Plain servlet mocks, no
- * Spring context: every line builds the registration, runs one request through its filter and
- * reads what the guard wrote and whether the chain behind it was reached.
+ * P8: the public ticket-assign PUT needs an authenticated org API key. Plain servlet mocks: every
+ * request line builds the registration, runs one request through its filter and reads what the
+ * guard wrote and whether the chain behind it was reached. T22.118 boots the configuration in a
+ * Spring context.
  */
 class QrushPublicTicketAssignGuardTest {
 
@@ -66,7 +71,7 @@ class QrushPublicTicketAssignGuardTest {
     }
 
     private static Outcome pass(MockHttpServletRequest request) throws Exception {
-        var registration = new QrushPublicTicketAssignGuard().qrushPublicTicketAssignGuard();
+        var registration = new QrushPublicTicketAssignGuard().qrushPublicTicketAssignGuardFilter();
         var response = new MockHttpServletResponse();
         var chain = new MockFilterChain();
         registration.getFilter().doFilter(request, response, chain);
@@ -226,7 +231,7 @@ class QrushPublicTicketAssignGuardTest {
     @Test
     @DisplayName("[T22.111] the guard is ordered after Spring Security so the principal is already set")
     void t22_111_registrationRunsAfterSpringSecurity() {
-        var registration = new QrushPublicTicketAssignGuard().qrushPublicTicketAssignGuard();
+        var registration = new QrushPublicTicketAssignGuard().qrushPublicTicketAssignGuardFilter();
 
         assertTrue(registration.getOrder() > SecurityProperties.DEFAULT_FILTER_ORDER,
             "order " + registration.getOrder() + " must be greater than " + SecurityProperties.DEFAULT_FILTER_ORDER);
@@ -235,12 +240,27 @@ class QrushPublicTicketAssignGuardTest {
     @Test
     @DisplayName("[T22.112] the guard is enabled and maps to /* or /api/v2/public/*, never to a mid-path wildcard")
     void t22_112_registrationIsEnabledWithAServletSafeMapping() {
-        var registration = new QrushPublicTicketAssignGuard().qrushPublicTicketAssignGuard();
+        var registration = new QrushPublicTicketAssignGuard().qrushPublicTicketAssignGuardFilter();
 
         // Boot maps an empty pattern set to /*; a servlet url-pattern cannot hold a wildcard mid-path
         var patterns = List.copyOf(registration.getUrlPatterns());
         assertTrue(registration.isEnabled());
         assertTrue(patterns.isEmpty() || patterns.equals(List.of("/*")) || patterns.equals(List.of("/api/v2/public/*")),
             "unexpected url patterns " + patterns);
+    }
+
+    @Test
+    @DisplayName("[T22.118] the configuration boots when component-scanned into a context that refuses bean overriding, as Spring Boot runs it")
+    void t22_118_scannedConfigurationBootsWithoutBeanOverriding() {
+        try (var context = new AnnotationConfigApplicationContext()) {
+            context.setAllowBeanDefinitionOverriding(false);
+            var scanner = new ClassPathBeanDefinitionScanner(context, false);
+            scanner.addIncludeFilter(new AssignableTypeFilter(QrushPublicTicketAssignGuard.class));
+            scanner.scan("alfio.config");
+
+            context.refresh();
+
+            assertEquals(1, context.getBeansOfType(FilterRegistrationBean.class).size());
+        }
     }
 }
