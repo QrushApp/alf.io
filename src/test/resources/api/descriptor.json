@@ -16625,15 +16625,7 @@
             }
           },
           "200" : {
-            "description" : "OK",
-            "content" : {
-              "*/*" : {
-                "schema" : {
-                  "type" : "string",
-                  "format" : "byte"
-                }
-              }
-            }
+            "description" : "OK"
           }
         }
       }
