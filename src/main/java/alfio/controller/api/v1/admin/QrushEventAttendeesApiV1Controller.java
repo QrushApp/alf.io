@@ -30,8 +30,10 @@ import alfio.model.api.v1.admin.DownloadedAttendeesByCategory;
 import alfio.repository.TicketRepository;
 import alfio.util.ImageUtil;
 import alfio.util.LocaleUtil;
+import jakarta.servlet.http.HttpServletResponse;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.springframework.http.CacheControl;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -46,6 +48,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.io.IOException;
 import java.security.Principal;
 import java.util.List;
 import java.util.Map;
@@ -191,20 +194,26 @@ public class QrushEventAttendeesApiV1Controller {
         return ResponseEntity.ok(new QrushReissuedTicket(newPublicUuid.toString()));
     }
 
+    // written to the response like upstream's public code.png: alf.io's message converters cannot write byte[]
     @GetMapping("/{slug}/qrush-ticket/{publicUuid}/code.png")
-    public ResponseEntity<byte[]> qrCode(@PathVariable String slug,
-                                         @PathVariable UUID publicUuid,
-                                         Principal principal) {
+    public void qrCode(@PathVariable String slug,
+                       @PathVariable UUID publicUuid,
+                       Principal principal,
+                       HttpServletResponse response) throws IOException {
         accessService.checkEventOwnership(principal, slug);
-        return ticketReservationManager.fetchCompleteAndAssigned(slug, publicUuid)
-            .map(triple -> {
-                var event = triple.getLeft();
-                return ResponseEntity.ok()
-                    .contentType(MediaType.IMAGE_PNG)
-                    .cacheControl(CacheControl.noStore())
-                    .body(ImageUtil.createQRCode(triple.getRight().ticketCode(event.getPrivateKey(), event.supportsQRCodeCaseInsensitive())));
-            })
-            .orElseGet(() -> ResponseEntity.notFound().build());
+        var data = ticketReservationManager.fetchCompleteAndAssigned(slug, publicUuid);
+        if (data.isEmpty()) {
+            response.setStatus(HttpServletResponse.SC_NOT_FOUND);
+            return;
+        }
+        var event = data.get().getLeft();
+        var png = ImageUtil.createQRCode(data.get().getRight().ticketCode(event.getPrivateKey(), event.supportsQRCodeCaseInsensitive()));
+        response.setContentType(MediaType.IMAGE_PNG_VALUE);
+        response.setHeader(HttpHeaders.CACHE_CONTROL, CacheControl.noStore().getHeaderValue());
+        try (var os = response.getOutputStream()) {
+            os.write(png);
+            response.flushBuffer();
+        }
     }
 
     public record QrushTicketSignature(int id, String signatureHash) {}

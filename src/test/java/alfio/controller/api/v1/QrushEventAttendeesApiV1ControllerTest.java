@@ -69,10 +69,14 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.converter.StringHttpMessageConverter;
+import org.springframework.http.converter.json.MappingJackson2HttpMessageConverter;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.ContextConfiguration;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -92,6 +96,7 @@ import java.util.stream.IntStream;
 import static alfio.test.util.IntegrationTestUtil.AVAILABLE_SEATS;
 import static alfio.test.util.IntegrationTestUtil.DESCRIPTION;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 
 @AlfioIntegrationTest
 @ContextConfiguration(classes = {DataSourceConfiguration.class, TestConfiguration.class, ControllerConfiguration.class})
@@ -859,27 +864,34 @@ class QrushEventAttendeesApiV1ControllerTest {
 
     // ---- P7: GET /qrush-ticket/{publicUuid}/code.png ----
 
+    private MockHttpServletResponse qrCode(String slug, UUID publicUuid, APITokenAuthentication key) throws Exception {
+        var response = new MockHttpServletResponse();
+        controller.qrCode(slug, publicUuid, key, response);
+        return response;
+    }
+
     @Test
     @DisplayName("[T22.161] qrCode serves the PNG of an assigned ticket with image/png and no-store")
-    void t22_161_qrCodeServesPngOfAssignedTicket() {
+    void t22_161_qrCodeServesPngOfAssignedTicket() throws Exception {
         var a = createAssignedTicketPair().get(0);
 
-        var response = controller.qrCode(event.getShortName(), a.getPublicUuid(), orgAKey);
+        var response = qrCode(event.getShortName(), a.getPublicUuid(), orgAKey);
 
-        assertEquals(200, response.getStatusCode().value());
-        assertEquals("image/png", response.getHeaders().getFirst(HttpHeaders.CONTENT_TYPE));
-        assertEquals("no-store", response.getHeaders().getFirst(HttpHeaders.CACHE_CONTROL));
-        assertArrayEquals(expectedQrPng(reread(a)), response.getBody());
+        assertEquals(200, response.getStatus());
+        assertEquals("image/png", response.getContentType());
+        assertEquals("no-store", response.getHeader(HttpHeaders.CACHE_CONTROL));
+        assertArrayEquals(expectedQrPng(reread(a)), response.getContentAsByteArray());
     }
 
     @Test
     @DisplayName("[T22.162] qrCode refuses an unassigned ticket with 404")
-    void t22_162_qrCodeRefusesUnassignedTicket() {
+    void t22_162_qrCodeRefusesUnassignedTicket() throws Exception {
         var t1 = createUnassignedTicket();
 
-        var response = controller.qrCode(event.getShortName(), t1.getPublicUuid(), orgAKey);
+        var response = qrCode(event.getShortName(), t1.getPublicUuid(), orgAKey);
 
-        assertEquals(404, response.getStatusCode().value());
+        assertEquals(404, response.getStatus());
+        assertEquals(0, response.getContentAsByteArray().length);
     }
 
     @Test
@@ -889,52 +901,72 @@ class QrushEventAttendeesApiV1ControllerTest {
         var orgB = createForeignOrg();
 
         assertThrows(AccessDeniedException.class,
-            () -> controller.qrCode(event.getShortName(), a.getPublicUuid(), orgB.key()));
+            () -> qrCode(event.getShortName(), a.getPublicUuid(), orgB.key()));
     }
 
     @Test
     @DisplayName("[T22.164] qrCode on an unknown slug is denied, never a 404")
     void t22_164_qrCodeOnUnknownSlugIsDenied() {
         assertThrows(AccessDeniedException.class,
-            () -> controller.qrCode("does-not-exist", U, orgAKey));
+            () -> qrCode("does-not-exist", U, orgAKey));
     }
 
     @Test
     @DisplayName("[T22.165] qrCode on org A's slug refuses a ticket of another event with 404")
-    void t22_165_qrCodeRefusesTicketOfAnotherEvent() {
+    void t22_165_qrCodeRefusesTicketOfAnotherEvent() throws Exception {
         var orgB = createForeignOrg();
         var tb = createForeignConfirmedTicket(orgB);
 
-        var response = controller.qrCode(event.getShortName(), tb.getPublicUuid(), orgAKey);
+        var response = qrCode(event.getShortName(), tb.getPublicUuid(), orgAKey);
 
-        assertEquals(404, response.getStatusCode().value());
+        assertEquals(404, response.getStatus());
     }
 
     @Test
     @DisplayName("[T22.166] qrCode refuses an assigned ticket of a reservation that was never confirmed with 404")
-    void t22_166_qrCodeRefusesTicketOfUnconfirmedReservation() {
+    void t22_166_qrCodeRefusesTicketOfUnconfirmedReservation() throws Exception {
         var ticket = singleTicketOf(createReservation(event, orgAKey, List.of("QR-5004")));
 
-        var response = controller.qrCode(event.getShortName(), ticket.getPublicUuid(), orgAKey);
+        var response = qrCode(event.getShortName(), ticket.getPublicUuid(), orgAKey);
 
-        assertEquals(404, response.getStatusCode().value());
+        assertEquals(404, response.getStatus());
     }
 
     @Test
     @DisplayName("[T22.167] after a reissue qrCode answers 404 for the old public uuid and a different PNG for the new one")
-    void t22_167_qrCodeOfOldUuidIsDeadAfterReissue() {
+    void t22_167_qrCodeOfOldUuidIsDeadAfterReissue() throws Exception {
         var a = createAssignedTicketPair().get(0);
         var p0 = a.getPublicUuid();
-        var before = controller.qrCode(event.getShortName(), p0, orgAKey);
-        assertEquals(200, before.getStatusCode().value());
-        var q0 = Objects.requireNonNull(before.getBody());
+        var before = qrCode(event.getShortName(), p0, orgAKey);
+        assertEquals(200, before.getStatus());
+        var q0 = before.getContentAsByteArray();
         var newPublicUuid = reissueOk(a);
 
-        var oldAnswer = controller.qrCode(event.getShortName(), p0, orgAKey);
-        var newAnswer = controller.qrCode(event.getShortName(), newPublicUuid, orgAKey);
+        var oldAnswer = qrCode(event.getShortName(), p0, orgAKey);
+        var newAnswer = qrCode(event.getShortName(), newPublicUuid, orgAKey);
 
-        assertEquals(404, oldAnswer.getStatusCode().value());
-        assertEquals(200, newAnswer.getStatusCode().value());
-        assertFalse(Arrays.equals(q0, Objects.requireNonNull(newAnswer.getBody())), "the new QR must differ from the old one");
+        assertEquals(404, oldAnswer.getStatus());
+        assertEquals(200, newAnswer.getStatus());
+        assertFalse(Arrays.equals(q0, newAnswer.getContentAsByteArray()), "the new QR must differ from the old one");
+    }
+
+    @Test
+    @DisplayName("[T22.168] qrCode serves the PNG through Spring MVC with alf.io's own message converters (Jackson and String only)")
+    void t22_168_qrCodeServesPngThroughAlfioMessageConverters() throws Exception {
+        var a = createAssignedTicketPair().get(0);
+        // the list MvcConfiguration#configureMessageConverters installs: none of them writes byte[]
+        var string = new StringHttpMessageConverter();
+        string.setSupportedMediaTypes(List.of(MediaType.ALL));
+        var mvc = MockMvcBuilders.standaloneSetup(controller)
+            .setMessageConverters(new MappingJackson2HttpMessageConverter(), string)
+            .build();
+
+        var response = mvc.perform(get("/api/v1/admin/event/{slug}/qrush-ticket/{publicUuid}/code.png", event.getShortName(), a.getPublicUuid())
+                .principal(orgAKey))
+            .andReturn().getResponse();
+
+        assertEquals(200, response.getStatus());
+        assertEquals("image/png", response.getContentType());
+        assertArrayEquals(expectedQrPng(reread(a)), response.getContentAsByteArray());
     }
 }
