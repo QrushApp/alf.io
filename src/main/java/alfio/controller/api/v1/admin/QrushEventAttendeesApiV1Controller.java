@@ -32,6 +32,7 @@ import alfio.util.ImageUtil;
 import alfio.util.LocaleUtil;
 import jakarta.servlet.http.HttpServletResponse;
 import org.apache.commons.codec.digest.DigestUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -39,6 +40,8 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.validation.BeanPropertyBindingResult;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -51,7 +54,9 @@ import org.springframework.web.bind.annotation.RestController;
 import java.io.IOException;
 import java.security.Principal;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -64,6 +69,7 @@ import java.util.stream.Collectors;
  * the qrush CF parser); the only difference is the status-agnostic additional-values lookup.
  * P4 qrush-ticket-signatures: sha256 of each assigned ticket's QR signature, the offline check-in key.
  * P5 assign, P6 reissue, P7 code.png: org-key ticket routes that replace the public bearer-uuid ones.
+ * P9: the assign runs in one transaction, sends no engine mail and answers the new QR text and its P4 hash.
  */
 @RestController
 @RequestMapping("/api/v1/admin/event")
@@ -73,6 +79,9 @@ public class QrushEventAttendeesApiV1Controller {
     // rotates both uuids of one reissuable (ACQUIRED or TO_BE_PAID) ticket; holder, status and reservation stay
     private static final String REISSUE_TICKET = "update ticket set uuid = :newUuid, public_uuid = :newPublicUuid"
         + " where id = :ticketId and event_id = :eventId and status in ('ACQUIRED', 'TO_BE_PAID')";
+    // P9: clears the old holder before a re-assign, inside the assign's transaction
+    private static final String BLANK_HOLDER = "update ticket set email_address = null, full_name = null, first_name = null, last_name = null"
+        + " where id = :ticketId and event_id = :eventId";
 
     private final AccessService accessService;
     private final EventManager eventManager;
@@ -81,6 +90,7 @@ public class QrushEventAttendeesApiV1Controller {
     private final TicketHelper ticketHelper;
     private final TicketReservationManager ticketReservationManager;
     private final NamedParameterJdbcTemplate jdbcTemplate;
+    private final TransactionTemplate transactionTemplate;
 
     public QrushEventAttendeesApiV1Controller(AccessService accessService,
                                               EventManager eventManager,
@@ -88,7 +98,8 @@ public class QrushEventAttendeesApiV1Controller {
                                               TicketRepository ticketRepository,
                                               TicketHelper ticketHelper,
                                               TicketReservationManager ticketReservationManager,
-                                              NamedParameterJdbcTemplate jdbcTemplate) {
+                                              NamedParameterJdbcTemplate jdbcTemplate,
+                                              PlatformTransactionManager transactionManager) {
         this.accessService = accessService;
         this.eventManager = eventManager;
         this.purchaseContextFieldManager = purchaseContextFieldManager;
@@ -96,6 +107,7 @@ public class QrushEventAttendeesApiV1Controller {
         this.ticketHelper = ticketHelper;
         this.ticketReservationManager = ticketReservationManager;
         this.jdbcTemplate = jdbcTemplate;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
     @GetMapping("/{slug}/qrush-attendees")
@@ -164,12 +176,43 @@ public class QrushEventAttendeesApiV1Controller {
                                     Principal principal) {
         accessService.checkEventOwnership(principal, slug);
         var event = eventManager.getSingleEvent(slug, principal.getName());
-        var bindingResult = new BeanPropertyBindingResult(form, "updateTicketOwner");
         var locale = LocaleUtil.forLanguageTag(form.getUserLanguage(), event);
-        // TicketHelper goes through fetchComplete: same event, COMPLETE reservation, else empty
+        // one transaction: every answer other than 200 rolls the blanking back
+        return Objects.requireNonNull(transactionTemplate.execute(status -> {
+            var response = assignInTransaction(slug, publicUuid, form, locale);
+            if (response.getStatusCode().value() != HttpStatus.OK.value()) {
+                status.setRollbackOnly();
+            }
+            return response;
+        }));
+    }
+
+    private ResponseEntity<?> assignInTransaction(String slug, UUID publicUuid, UpdateTicketOwnerForm form, Locale locale) {
+        // same event, COMPLETE reservation, else 404
+        var complete = ticketReservationManager.fetchComplete(slug, publicUuid);
+        if (complete.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        var ticket = complete.get().getRight();
+        // with the old address blank, upstream sends neither the owner-changed mail nor the organizer warning;
+        // a locked ticket keeps its holder, as upstream overwrites the form with it
+        if (!ticket.getLockedAssignment() && (StringUtils.isNotBlank(ticket.getEmail()) || StringUtils.isNotBlank(ticket.getFullName()))) {
+            jdbcTemplate.update(BLANK_HOLDER, new MapSqlParameterSource("ticketId", ticket.getId())
+                .addValue("eventId", complete.get().getLeft().getId()));
+        }
+        var bindingResult = new BeanPropertyBindingResult(form, "updateTicketOwner");
         return ticketHelper.assignTicket(slug, publicUuid, form, Optional.of(bindingResult), locale)
-            .map(r -> ResponseEntity.status(r.getLeft().isSuccess() ? HttpStatus.OK : HttpStatus.UNPROCESSABLE_ENTITY)
-                .body(new ValidatedResponse<>(r.getLeft(), r.getLeft().isSuccess())))
+            .<ResponseEntity<?>>map(r -> {
+                if (!r.getLeft().isSuccess()) {
+                    return ResponseEntity.unprocessableEntity().body(new ValidatedResponse<>(r.getLeft(), false));
+                }
+                // TicketHelper hands back the ticket as loaded before the update: re-read for the new holder
+                var assigned = ticketRepository.findByUUID(r.getRight().getUuid());
+                var event = r.getMiddle();
+                return ResponseEntity.ok(new QrushAssignedTicket(
+                    assigned.ticketCode(event.getPrivateKey(), event.supportsQRCodeCaseInsensitive()),
+                    DigestUtils.sha256Hex(assigned.hmacTicketInfo(event.getPrivateKey(), event.supportsQRCodeCaseInsensitive()))));
+            })
             .orElseGet(() -> ResponseEntity.notFound().build());
     }
 

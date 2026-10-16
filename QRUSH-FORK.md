@@ -4,8 +4,9 @@ Fork of alfio-event/alf.io. Working branch: qrush/2.0-M5-2606, cut from tag 2.0-
 Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workflows/qrush-build.yml).
 
 ## Rules
-1. ADDITIVE ONLY. Patches are new files (controllers under alfio.controller.api.v1.admin, one
-   fork-owned security filter under alfio.config (P8, assumes D23), tests, workflow, this doc).
+1. ADDITIVE ONLY. Patches are new files (controllers under alfio.controller.api.v1.admin, two
+   fork-owned servlet filters under alfio.config (P8, assumes D23; P9's proxy allowlist), tests,
+   workflow, this doc).
    Never edit upstream files — no core managers, no upstream security config, no SQL migrations.
    Gate: `git diff --name-only 2.0-M5-2606..HEAD` lists fork-owned files only.
 2. Pinned tag. The branch tracks tag 2.0-M5-2606 until a deliberate rebase. Never merge upstream
@@ -32,9 +33,10 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
   rule above applies to the reservation-action endpoints, not here.
 - P4 POST /api/v1/admin/event/{slug}/qrush-ticket-signatures (QrushEventAttendeesApiV1Controller, team-test) — the door list's sha256 of each ticket's QR signature, the offline check-in key, which upstream returns only encrypted and one id at a time; plus signatureHash on P2's ticket detail
 - P5 PUT  /api/v1/admin/event/{slug}/qrush-ticket/{publicUuid}/assign (QrushEventAttendeesApiV1Controller,
-  W15) — org-key twin of the public ticket-assign PUT: same UpdateTicketOwnerForm body and
-  ValidatedResponse answer (200 / 422), delegates to TicketHelper#assignTicket, whose fetchComplete
-  refuses a ticket of another event or outside a COMPLETE reservation (404). The qrush CF assigns here.
+  W15) — org-key twin of the public ticket-assign PUT: same UpdateTicketOwnerForm body, delegates to
+  TicketHelper#assignTicket, whose fetchComplete refuses a ticket of another event or outside a
+  COMPLETE reservation (404); 422 answers the ValidatedResponse. The qrush CF assigns here. Since P9
+  the 200 answers `{ qrText, signatureHash }` (see P9).
 - P6 POST /api/v1/admin/event/{slug}/qrush-ticket/{publicUuid}/reissue (QrushEventAttendeesApiV1Controller,
   W15) — after a transfer: one UPDATE scoped to the ticket id gives it a fresh uuid AND public_uuid
   and changes nothing else; only a ticket of that event in a COMPLETE reservation with status
@@ -48,6 +50,53 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
   after springSecurityFilterChain: `PUT /api/v2/public/event/{e}/ticket/{uuid}` answers 403 unless
   the principal is an APITokenAuthentication holding ROLE_API_CLIENT. Upstream security config stays
   untouched. Caddy refuses the same PUT once the CF assigns through P5.
+- P9 (mail and sale run, wave 1) — three parts:
+  - The P5 assign answers `{ qrText, signatureHash }`: qrText = the ticket's `ticketCode(event
+    private key, case flag)` (internal uuid + "/" + signature, the P7 PNG's text, so a secret like
+    P2's uuid), signatureHash = the P4 hash. Both come from the ticket RE-READ after the assign,
+    because TicketHelper hands back the ticket as loaded before the update.
+  - The assign runs in ONE fork transaction (TransactionTemplate): fetchComplete first (404 as
+    before), then, unless the ticket is locked (locked_assignment), fork SQL blanks email_address,
+    full_name, first_name, last_name of that ticket (event-scoped), then TicketHelper#assignTicket.
+    With the old address blank, upstream's owner-changed mail and the organizer's "reassigned after
+    event start" warning never fire (TicketReservationManager#updateTicketOwner); the ticket mail
+    stays off through SEND_TICKETS_AUTOMATICALLY=false (see the box settings below). Every answer
+    other than 200 (404, 422) rolls the blanking back. Because upstream no longer sees a re-assign,
+    the blanking also drops `invalidateAccess`: the TICKET_HOLDER_CHANGED audit row and the
+    InvalidateAccess event (alf.io wallet pass revocation). qrush uses none of them; P6 rotates the
+    uuids after a transfer.
+  - `alfio.config.QrushProxiedRequestAllowlist`, a servlet filter at the highest precedence on /*:
+    a request carrying X-Qrush-Proxy (Caddy sets it on every forwarded request) or any of
+    X-Forwarded-For, X-Forwarded-Proto, X-Forwarded-Host, Forwarded passes only when its path
+    (context stripped, each segment decoded, matrix parameters dropped, any decoded `..` refused)
+    starts with /admin/api/check-in/ or /api/v1/admin/, or equals /healthz. Every other proxied
+    request answers 404 with an empty body (setStatus, never sendError). A request without those
+    headers (the ops UI through the SSH tunnel) passes.
+- P10 POST /api/v1/admin/event/{slug}/qrush-hold (QrushHoldApiV1Controller, mail and sale run) — the
+  CF's hold. Body: upstream's create fields `{ tickets, additionalServices, language, user,
+  externalReference }` plus optional `ceilings { capacity?, rows: [{ categoryId, max }], groups:
+  [{ categoryIds, max }] }`. One transaction, in this order: accessService.checkEventReservationCreationRequest
+  (also refuses another event's categories); `SET LOCAL lock_timeout` (property
+  `qrush.hold.lock-timeout-ms`, default 500); with ceilings only, `pg_advisory_xact_lock(1363692612,
+  <event id>)` (namespace 0x51484C44, "QHLD"); lookup of ext_reference `<orderId>:0` (a hit answers
+  that hold, `created: false`, no `remaining`); the ceiling counts from
+  TicketRepository#countConfirmedAndPendingTickets (PENDING, ACQUIRED, CHECKED_IN, TO_BE_PAID) — rows
+  first, then groups (the sum over all their categories), then capacity (every category of the
+  event), refusal 409 `{ refused: row|group|capacity, remaining }`; the upstream
+  ReservationApiV1Controller#createTicketsReservation (its @Transactional joins; a non-2xx answer is
+  returned unchanged and the route marks its own transaction rollback-only, so a NotEnoughTickets
+  stays a 400 instead of an UnexpectedRollbackException); then ext_reference `<orderId>:<i>` on the
+  reservation's tickets in ticket id order (the engine's own order is random). 200 `{ reservationId,
+  validity, created, tickets: [{ id, publicUuid, categoryId }], remaining? }`; remaining = max − count,
+  never below 0, after the hold. A lock timeout (55P03) answers 423 `{ busy: true }`; a unique
+  violation on ticket_ref_unique (a concurrent hold for the same order) re-reads in a new transaction
+  and answers that hold. RESET_TICKET clears ext_reference on release, void or expiry, so a voided or
+  expired hold is replaced by a new one. Only this route takes the lock; waiters hold a pool
+  connection for at most the lock timeout. P3 now emits `<orderId>:<i>` as externalReference.
+- Box settings (precondition for P9 and P10, SYSTEM level, set by qrush_tickets' engine-settings
+  script): SEND_TICKETS_AUTOMATICALLY=false (the engine never mails a ticket on assignment) and
+  ASSIGNMENT_REMINDER_START=0 (no assignment reminder; pinned by QrushHoldApiV1ControllerTest
+  [P10.12]).
 - Further wave-2 candidates: see share/Fable/ticket/wave-2-backlog.md in the qrush repo.
 - `src/test/resources/api/descriptor.json` — REGENERATED (the one non-additive change; upstream's
   own sanctioned mechanism): `TestCheckRestApiStability` diffs the REST surface against this
@@ -63,11 +112,13 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
 1. pg_dump the production DB (Flyway is forward-only) — qrush_tickets runbook.
 2. New branch qrush/<new-tag> from the new tag; cherry-pick fork-owned files (additive => trivial).
 3. MANDATORY: full run of QrushReservationApiV1ControllerTest,
-   QrushEventAttendeesApiV1ControllerTest AND QrushPublicTicketAssignGuardTest — the cross-org tests
-   (crossOrgKeyCannotRead/Void*, unknownSlug*, crossOrgKeyCannotReadForeignAttendees,
-   crossOrgKeyCannotReadForeignSignatures, crossOrgKeyCannotAssignForeignTicket,
-   crossOrgKeyCannotReissueForeignTicket, crossOrgKeyCannotReadForeignTicketQr) and the guard
-   suite must pass
+   QrushEventAttendeesApiV1ControllerTest, QrushPublicTicketAssignGuardTest,
+   QrushHoldApiV1ControllerTest, QrushProxiedRequestAllowlistTest AND QrushAssignMailTest (each with
+   -Dpgsql.version=16) — the cross-org tests (crossOrgKeyCannotRead/Void*, unknownSlug*,
+   crossOrgKeyCannotReadForeignAttendees, crossOrgKeyCannotReadForeignSignatures,
+   crossOrgKeyCannotAssignForeignTicket, crossOrgKeyCannotReissueForeignTicket,
+   crossOrgKeyCannotReadForeignTicketQr, the hold's [P10.4]), the guard suite, the proxy allowlist's
+   mapping walk [P9.13] and the no-mail assign [P9.5] must pass
    unmodified. A guard-signature change upstream fails compilation loudly; a behavior change
    fails these tests. Never relax them.
 4. Re-check the P2 overlap decision, CI pgsql matrix version, and Dockerfile drift.
