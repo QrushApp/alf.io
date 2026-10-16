@@ -51,6 +51,7 @@ import alfio.repository.user.OrganizationRepository;
 import alfio.test.util.AlfioIntegrationTest;
 import alfio.test.util.IntegrationTestUtil;
 import alfio.util.ClockProvider;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -67,8 +68,11 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.ZonedDateTime;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
@@ -106,8 +110,7 @@ class QrushAssignMailTest {
     @BeforeEach
     void setUp() {
         IntegrationTestUtil.ensureMinimalConfiguration(configurationRepository);
-        configurationRepository.deleteByKey(ConfigurationKeys.SEND_TICKETS_AUTOMATICALLY.getValue());
-        configurationRepository.insert(ConfigurationKeys.SEND_TICKETS_AUTOMATICALLY.getValue(), "false", "");
+        setSystemConfiguration(ConfigurationKeys.SEND_TICKETS_AUTOMATICALLY, "false");
         event = IntegrationTestUtil.initEvent(List.of(new TicketCategoryModification(null, "default", TicketCategory.TicketAccessType.INHERIT, AVAILABLE_SEATS,
                 new DateTimeModification(LocalDate.now(clockProvider.getClock()).minusDays(1), LocalTime.now(clockProvider.getClock())),
                 new DateTimeModification(LocalDate.now(clockProvider.getClock()).plusDays(1), LocalTime.now(clockProvider.getClock())),
@@ -118,6 +121,29 @@ class QrushAssignMailTest {
             "test@example.com", Role.API_CONSUMER, User.Type.INTERNAL, null);
         var authorities = authorityRepository.findRoles(username).stream().map(SimpleGrantedAuthority::new).toList();
         orgKey = new APITokenAuthentication(username, null, authorities);
+    }
+
+    /** A system-level configuration row as this test found it; absent when no row existed. */
+    private record FoundSetting(String value, String description) {}
+
+    // the database outlives this class: every system setting written here is put back after each test
+    private final Map<String, Optional<FoundSetting>> foundSettings = new LinkedHashMap<>();
+
+    private void setSystemConfiguration(ConfigurationKeys key, String value) {
+        foundSettings.computeIfAbsent(key.getValue(), k -> jdbc.query(
+            "select c_value, description from configuration where c_key = :key", new MapSqlParameterSource("key", k),
+            (rs, row) -> new FoundSetting(rs.getString("c_value"), rs.getString("description"))).stream().findFirst());
+        configurationRepository.deleteByKey(key.getValue());
+        configurationRepository.insert(key.getValue(), value, "");
+    }
+
+    @AfterEach
+    void restoreSystemConfiguration() {
+        foundSettings.forEach((key, found) -> {
+            configurationRepository.deleteByKey(key);
+            found.ifPresent(f -> configurationRepository.insert(key, f.value(), f.description()));
+        });
+        foundSettings.clear();
     }
 
     private static UpdateTicketOwnerForm holder(String firstName, String lastName, String email) {

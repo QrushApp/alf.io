@@ -68,6 +68,7 @@ import alfio.test.util.IntegrationTestUtil;
 import alfio.util.ClockProvider;
 import alfio.util.Json;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -94,6 +95,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
@@ -155,9 +157,36 @@ class QrushHoldApiV1ControllerTest {
         e = newFixture();
     }
 
+    /** A system-level configuration row as this test found it; absent when no row existed. */
+    private record FoundSetting(String value, String description) {}
+
+    // the database outlives this class: every system setting written here is put back after each test
+    private final Map<String, Optional<FoundSetting>> foundSettings = new LinkedHashMap<>();
+
+    private void rememberSystemConfiguration(ConfigurationKeys key) {
+        foundSettings.computeIfAbsent(key.getValue(), k -> jdbc.query(
+            "select c_value, description from configuration where c_key = :key", new MapSqlParameterSource("key", k),
+            (rs, row) -> new FoundSetting(rs.getString("c_value"), rs.getString("description"))).stream().findFirst());
+    }
+
     private void setSystemConfiguration(ConfigurationKeys key, String value) {
+        rememberSystemConfiguration(key);
         configurationRepository.deleteByKey(key.getValue());
         configurationRepository.insert(key.getValue(), value, "");
+    }
+
+    private void removeSystemConfiguration(ConfigurationKeys key) {
+        rememberSystemConfiguration(key);
+        configurationRepository.deleteByKey(key.getValue());
+    }
+
+    @AfterEach
+    void restoreSystemConfiguration() {
+        foundSettings.forEach((key, found) -> {
+            configurationRepository.deleteByKey(key);
+            found.ifPresent(f -> configurationRepository.insert(key, f.value(), f.description()));
+        });
+        foundSettings.clear();
     }
 
     private APITokenAuthentication apiKey(String username) {
@@ -533,7 +562,7 @@ class QrushHoldApiV1ControllerTest {
 
         assertEquals(0, jdbc.queryForObject(countReminders, params, Integer.class));
 
-        configurationRepository.deleteByKey(ConfigurationKeys.ASSIGNMENT_REMINDER_START.getValue());
+        removeSystemConfiguration(ConfigurationKeys.ASSIGNMENT_REMINDER_START);
         ticketReservationManager.sendReminderForTicketAssignment();
 
         assertEquals(1, jdbc.queryForObject(countReminders, params, Integer.class), "control: the default start writes the reminder");

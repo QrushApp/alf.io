@@ -72,6 +72,7 @@ import com.google.zxing.client.j2se.BufferedImageLuminanceSource;
 import com.google.zxing.common.HybridBinarizer;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.lang3.tuple.Pair;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -81,6 +82,8 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.StringHttpMessageConverter;
 import org.springframework.http.converter.json.MappingJackson2HttpMessageConverter;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.test.context.ActiveProfiles;
@@ -98,9 +101,11 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.IntStream;
 
@@ -135,6 +140,7 @@ class QrushEventAttendeesApiV1ControllerTest {
     @Autowired private QrushReservationApiV1Controller qrushReservationController;
     @Autowired private TicketApiV2Controller upstreamTicketController;
     @Autowired private AuthorityRepository authorityRepository;
+    @Autowired private NamedParameterJdbcTemplate jdbc;
 
     private Event event;
     private APITokenAuthentication orgAKey;
@@ -143,8 +149,7 @@ class QrushEventAttendeesApiV1ControllerTest {
     void setUp() {
         IntegrationTestUtil.ensureMinimalConfiguration(configurationRepository);
         // as on the boxes: the engine never mails a ticket on assignment
-        configurationRepository.deleteByKey(ConfigurationKeys.SEND_TICKETS_AUTOMATICALLY.getValue());
-        configurationRepository.insert(ConfigurationKeys.SEND_TICKETS_AUTOMATICALLY.getValue(), "false", "");
+        setSystemConfiguration(ConfigurationKeys.SEND_TICKETS_AUTOMATICALLY, "false");
         Pair<Event, String> eventAndUser = IntegrationTestUtil.initEvent(defaultCategories(),
             organizationRepository, userManager, eventManager, eventRepository);
         event = eventAndUser.getLeft();
@@ -153,6 +158,29 @@ class QrushEventAttendeesApiV1ControllerTest {
             "test@example.com", Role.API_CONSUMER, User.Type.INTERNAL, null);
         orgAKey = apiKey(apiKeyUsername);
         addTicketNumberField(event);
+    }
+
+    /** A system-level configuration row as this test found it; absent when no row existed. */
+    private record FoundSetting(String value, String description) {}
+
+    // the database outlives this class: every system setting written here is put back after each test
+    private final Map<String, Optional<FoundSetting>> foundSettings = new LinkedHashMap<>();
+
+    private void setSystemConfiguration(ConfigurationKeys key, String value) {
+        foundSettings.computeIfAbsent(key.getValue(), k -> jdbc.query(
+            "select c_value, description from configuration where c_key = :key", new MapSqlParameterSource("key", k),
+            (rs, row) -> new FoundSetting(rs.getString("c_value"), rs.getString("description"))).stream().findFirst());
+        configurationRepository.deleteByKey(key.getValue());
+        configurationRepository.insert(key.getValue(), value, "");
+    }
+
+    @AfterEach
+    void restoreSystemConfiguration() {
+        foundSettings.forEach((key, found) -> {
+            configurationRepository.deleteByKey(key);
+            found.ifPresent(f -> configurationRepository.insert(key, f.value(), f.description()));
+        });
+        foundSettings.clear();
     }
 
     /**
