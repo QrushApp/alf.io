@@ -23,6 +23,7 @@ import alfio.config.authentication.support.APITokenAuthentication;
 import alfio.controller.api.ControllerConfiguration;
 import alfio.controller.api.v1.admin.EventApiV1Controller;
 import alfio.controller.api.v1.admin.QrushEventAttendeesApiV1Controller;
+import alfio.controller.api.v1.admin.QrushEventAttendeesApiV1Controller.QrushAssignedTicket;
 import alfio.controller.api.v1.admin.QrushReservationApiV1Controller;
 import alfio.controller.api.v1.admin.ReservationApiV1Controller;
 import alfio.controller.api.v2.user.TicketApiV2Controller;
@@ -30,6 +31,7 @@ import alfio.controller.form.UpdateTicketOwnerForm;
 import alfio.manager.EventManager;
 import alfio.manager.PurchaseContextFieldManager;
 import alfio.manager.support.AccessDeniedException;
+import alfio.manager.support.response.ValidatedResponse;
 import alfio.manager.user.UserManager;
 import alfio.model.Event;
 import alfio.model.Ticket;
@@ -48,6 +50,7 @@ import alfio.model.modification.AdminReservationModification.TransactionDetails;
 import alfio.model.modification.AttendeeData;
 import alfio.model.modification.DateTimeModification;
 import alfio.model.modification.TicketCategoryModification;
+import alfio.model.system.ConfigurationKeys;
 import alfio.model.transaction.PaymentProxy;
 import alfio.model.user.Role;
 import alfio.model.user.User;
@@ -62,6 +65,11 @@ import alfio.test.util.IntegrationTestUtil;
 import alfio.util.ClockProvider;
 import alfio.util.ImageUtil;
 import alfio.util.Json;
+import com.google.zxing.BinaryBitmap;
+import com.google.zxing.DecodeHintType;
+import com.google.zxing.MultiFormatReader;
+import com.google.zxing.client.j2se.BufferedImageLuminanceSource;
+import com.google.zxing.common.HybridBinarizer;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.junit.jupiter.api.BeforeEach;
@@ -70,6 +78,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.StringHttpMessageConverter;
 import org.springframework.http.converter.json.MappingJackson2HttpMessageConverter;
 import org.springframework.mock.web.MockHttpServletResponse;
@@ -78,6 +87,8 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
+import javax.imageio.ImageIO;
+import java.io.ByteArrayInputStream;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -131,6 +142,9 @@ class QrushEventAttendeesApiV1ControllerTest {
     @BeforeEach
     void setUp() {
         IntegrationTestUtil.ensureMinimalConfiguration(configurationRepository);
+        // as on the boxes: the engine never mails a ticket on assignment
+        configurationRepository.deleteByKey(ConfigurationKeys.SEND_TICKETS_AUTOMATICALLY.getValue());
+        configurationRepository.insert(ConfigurationKeys.SEND_TICKETS_AUTOMATICALLY.getValue(), "false", "");
         Pair<Event, String> eventAndUser = IntegrationTestUtil.initEvent(defaultCategories(),
             organizationRepository, userManager, eventManager, eventRepository);
         event = eventAndUser.getLeft();
@@ -490,10 +504,60 @@ class QrushEventAttendeesApiV1ControllerTest {
         return rows.get(0);
     }
 
-    /** Setup step through P5: the assignment must succeed. */
-    private void assignRitaOk(Ticket row) {
-        var response = controller.assign(event.getShortName(), row.getPublicUuid(), ritaBody(), orgAKey);
-        assertEquals(200, response.getStatusCode().value());
+    /** Setup step through P5: the assignment must succeed; answers its QR text and hash. */
+    private QrushAssignedTicket assignRitaOk(Ticket row) {
+        return assignedAnswer(controller.assign(event.getShortName(), row.getPublicUuid(), ritaBody(), orgAKey));
+    }
+
+    /** P9: the 200 body of the assign. */
+    private static QrushAssignedTicket assignedAnswer(ResponseEntity<?> response) {
+        assertEquals(200, response.getStatusCode().value(), "body " + response.getBody());
+        return assertInstanceOf(QrushAssignedTicket.class, response.getBody());
+    }
+
+    /** P9: the answer is the QR text and P4 hash of the ticket as the database holds it after the assign. */
+    private void assertAnswersTicket(QrushAssignedTicket answer, Ticket reread) {
+        var rereadEvent = eventRepository.findById(event.getId());
+        assertEquals(reread.ticketCode(rereadEvent.getPrivateKey(), rereadEvent.supportsQRCodeCaseInsensitive()), answer.qrText());
+        assertEquals(expectedSignatureHash(reread), answer.signatureHash());
+    }
+
+    private static UpdateTicketOwnerForm maxBody() {
+        var form = new UpdateTicketOwnerForm();
+        form.setFirstName("Max");
+        form.setLastName("Mustermann");
+        form.setFullName("Max Mustermann");
+        form.setEmail("max@example.org");
+        form.setUserLanguage("en");
+        form.setAdditional(new HashMap<>());
+        return form;
+    }
+
+    /** Confirmed the production way: a bare quantity plus a buyer, then the ADMIN comp confirm without engine mails (ACQUIRED). */
+    private Ticket createCompConfirmedUnassignedTicket() {
+        var category = ticketCategoryRepository.findFirstWithAvailableTickets(event.getId()).orElseThrow();
+        var buyer = new ReservationUser(null, "Buyer", "McBuyer", "buyer@example.org", null);
+        var creationRequest = new TicketReservationCreationRequest(
+            List.of(new AttendeesByCategory(category.getId(), 1, List.of(), null)),
+            List.of(), null, buyer, null, "en", null, null);
+        var created = upstreamReservationController.createTicketsReservation(event.getShortName(), creationRequest, orgAKey);
+        assertTrue(created.getStatusCode().is2xxSuccessful());
+        var reservationId = Objects.requireNonNull(Objects.requireNonNull(created.getBody()).id());
+        var confirmation = new ReservationConfirmationRequest(
+            new TransactionDetails("qrush-comp", BigDecimal.ZERO,
+                LocalDateTime.now(clockProvider.getClock()), "qrush comp ($0) finalize", PaymentProxy.ADMIN),
+            new Notification(false, false), null);
+        assertTrue(upstreamReservationController.confirmReservation(reservationId, confirmation, orgAKey)
+            .getStatusCode().is2xxSuccessful());
+        var ticket = singleTicketOf(reservationId);
+        assertEquals(Ticket.TicketStatus.ACQUIRED, ticket.getStatus());
+        return ticket;
+    }
+
+    private static String decodeQr(byte[] png) throws Exception {
+        var image = ImageIO.read(new ByteArrayInputStream(png));
+        var bitmap = new BinaryBitmap(new HybridBinarizer(new BufferedImageLuminanceSource(image)));
+        return new MultiFormatReader().decode(bitmap, Map.of(DecodeHintType.PURE_BARCODE, Boolean.TRUE)).getText();
     }
 
     /** Setup step through P6: the reissue must succeed; answers the new public uuid. */
@@ -512,17 +576,18 @@ class QrushEventAttendeesApiV1ControllerTest {
     // ---- P5: PUT /qrush-ticket/{publicUuid}/assign ----
 
     @Test
-    @DisplayName("[T22.121] assign writes Rita as holder of an unassigned ticket and answers 200")
+    @DisplayName("[T22.121] assign writes Rita as holder of an unassigned ticket and answers 200 [P9.6]")
     void t22_121_assignWritesHolderOfUnassignedTicket() {
         var t1 = createUnassignedTicket();
 
         var response = controller.assign(event.getShortName(), t1.getPublicUuid(), ritaBody(), orgAKey);
 
-        assertEquals(200, response.getStatusCode().value());
+        var answer = assignedAnswer(response);
         var reread = reread(t1);
         assertEquals("Rita Recipient", reread.getFullName());
         assertEquals("rita@example.org", reread.getEmail());
         assertTrue(reread.getAssigned());
+        assertAnswersTicket(answer, reread);
     }
 
     @Test
@@ -539,19 +604,19 @@ class QrushEventAttendeesApiV1ControllerTest {
     }
 
     @Test
-    @DisplayName("[T22.123] assign stores the ticket number from additional and the attendee export lists it")
+    @DisplayName("[T22.123] assign stores the ticket number from additional and the attendee export lists it [P9.6]")
     void t22_123_assignStoresTicketNumberFromAdditional() {
         var t1 = createUnassignedTicket();
 
         var response = controller.assign(event.getShortName(), t1.getPublicUuid(), ritaBodyWithTicketNumber("QR-5001"), orgAKey);
 
-        assertEquals(200, response.getStatusCode().value());
+        assertAnswersTicket(assignedAnswer(response), reread(t1));
         var attendees = Objects.requireNonNull(controller.qrushAttendees(event.getShortName(), orgAKey).getBody());
         assertTrue(ticketNumbersIn(attendees).contains("QR-5001"), "ticket numbers " + ticketNumbersIn(attendees));
     }
 
     @Test
-    @DisplayName("[T22.124] (pin) assign without an additional map still assigns")
+    @DisplayName("[T22.124] (pin) assign without an additional map still assigns [P9.6]")
     void t22_124_assignWithoutAdditionalMapStillAssigns() {
         var t1 = createUnassignedTicket();
         var form = ritaBody();
@@ -559,12 +624,13 @@ class QrushEventAttendeesApiV1ControllerTest {
 
         var response = controller.assign(event.getShortName(), t1.getPublicUuid(), form, orgAKey);
 
-        assertEquals(200, response.getStatusCode().value());
+        var answer = assignedAnswer(response);
         assertTrue(reread(t1).getAssigned());
+        assertAnswersTicket(answer, reread(t1));
     }
 
     @Test
-    @DisplayName("[T22.125] assign with an invalid e-mail answers 422 and leaves the ticket unassigned")
+    @DisplayName("[T22.125] assign with an invalid e-mail answers 422 and leaves the ticket unassigned [P9.6]")
     void t22_125_assignWithInvalidEmailAnswers422() {
         var t1 = createUnassignedTicket();
         var form = ritaBody();
@@ -573,6 +639,9 @@ class QrushEventAttendeesApiV1ControllerTest {
         var response = controller.assign(event.getShortName(), t1.getPublicUuid(), form, orgAKey);
 
         assertEquals(422, response.getStatusCode().value());
+        ValidatedResponse<?> body = assertInstanceOf(ValidatedResponse.class, response.getBody());
+        assertFalse(body.isSuccess());
+        assertTrue(body.getErrorCount() > 0, "the 422 carries the validation errors");
         assertFalse(reread(t1).getAssigned());
     }
 
@@ -619,28 +688,114 @@ class QrushEventAttendeesApiV1ControllerTest {
     }
 
     @Test
-    @DisplayName("[T22.130] assign refuses a ticket of a reservation that was never confirmed with 404")
+    @DisplayName("[T22.130] assign refuses a ticket of a reservation that was never confirmed with 404 and keeps its holder [P9.6]")
     void t22_130_assignRefusesTicketOfUnconfirmedReservation() {
         var ticket = singleTicketOf(createReservation(event, orgAKey, List.of("QR-5002")));
 
         var response = controller.assign(event.getShortName(), ticket.getPublicUuid(), ritaBody(), orgAKey);
 
         assertEquals(404, response.getStatusCode().value());
-        assertNotEquals("rita@example.org", reread(ticket).getEmail());
+        var reread = reread(ticket);
+        assertNotEquals("rita@example.org", reread.getEmail());
+        assertEquals(ticket.getFullName(), reread.getFullName());
+        assertEquals(ticket.getEmail(), reread.getEmail());
     }
 
     @Test
-    @DisplayName("[T22.131] (pin) assigning the same body again answers 200 and keeps the holder (retry-safe)")
+    @DisplayName("[T22.131] (pin) assigning the same body again answers 200 and keeps the holder (retry-safe) [P9.6]")
     void t22_131_assignTwiceWithSameBodyKeepsHolder() {
         var t1 = createUnassignedTicket();
-        assignRitaOk(t1);
+        var first = assignRitaOk(t1);
 
         var again = controller.assign(event.getShortName(), t1.getPublicUuid(), ritaBody(), orgAKey);
 
-        assertEquals(200, again.getStatusCode().value());
+        var answer = assignedAnswer(again);
         var reread = reread(t1);
         assertEquals("Rita Recipient", reread.getFullName());
         assertEquals("rita@example.org", reread.getEmail());
+        assertAnswersTicket(answer, reread);
+        assertEquals(first, answer, "the same holder keeps the same QR");
+    }
+
+    // ---- P9: the assign answers its QR text and hash ----
+
+    @Test
+    @DisplayName("[P9.1] assign answers the re-read ticket's QR text, which starts with its internal uuid, and the hash P4 answers")
+    void p9_1_assignAnswersQrTextAndSignatureHash() {
+        var t1 = createCompConfirmedUnassignedTicket();
+
+        var answer = assignedAnswer(controller.assign(event.getShortName(), t1.getPublicUuid(), ritaBody(), orgAKey));
+
+        var reread = reread(t1);
+        assertAnswersTicket(answer, reread);
+        assertTrue(answer.qrText().startsWith(reread.getUuid() + "/"), "qrText " + answer.qrText());
+        var p4 = controller.qrushTicketSignatures(event.getShortName(), List.of(t1.getId()), orgAKey);
+        assertEquals(List.of(new QrushEventAttendeesApiV1Controller.QrushTicketSignature(t1.getId(), answer.signatureHash())), p4.getBody());
+        var signature = answer.qrText().substring(answer.qrText().indexOf('/') + 1);
+        assertEquals(DigestUtils.sha256Hex(signature), answer.signatureHash());
+    }
+
+    @Test
+    @DisplayName("[P9.2] the PNG P7 serves decodes to the qrText the assign answered")
+    void p9_2_qrPngDecodesToTheAssignedQrText() throws Exception {
+        var t1 = createCompConfirmedUnassignedTicket();
+        var answer = assignRitaOk(t1);
+
+        var png = qrCode(event.getShortName(), t1.getPublicUuid(), orgAKey);
+
+        assertEquals(200, png.getStatus());
+        assertEquals(answer.qrText(), decodeQr(png.getContentAsByteArray()));
+    }
+
+    @Test
+    @DisplayName("[P9.3] re-assigning Rita's ticket to Max answers a different qrText and P4 now answers Max's hash")
+    void p9_3_reassignAnswersTheNewHoldersQr() {
+        var t1 = createCompConfirmedUnassignedTicket();
+        var rita = assignRitaOk(t1);
+
+        var max = assignedAnswer(controller.assign(event.getShortName(), t1.getPublicUuid(), maxBody(), orgAKey));
+
+        assertNotEquals(rita.qrText(), max.qrText());
+        var reread = reread(t1);
+        assertEquals("Max Mustermann", reread.getFullName());
+        assertEquals("max@example.org", reread.getEmail());
+        assertAnswersTicket(max, reread);
+        var p4 = controller.qrushTicketSignatures(event.getShortName(), List.of(t1.getId()), orgAKey);
+        assertEquals(List.of(new QrushEventAttendeesApiV1Controller.QrushTicketSignature(t1.getId(), max.signatureHash())), p4.getBody());
+    }
+
+    @Test
+    @DisplayName("[P9.4] a re-assign with an invalid e-mail answers 422 and the ticket still names Rita (the blanking rolled back)")
+    void p9_4_invalidReassignRollsTheBlankingBack() {
+        var t1 = createCompConfirmedUnassignedTicket();
+        assignRitaOk(t1);
+        var form = maxBody();
+        form.setEmail("not-an-email");
+
+        var response = controller.assign(event.getShortName(), t1.getPublicUuid(), form, orgAKey);
+
+        assertEquals(422, response.getStatusCode().value());
+        ValidatedResponse<?> body = assertInstanceOf(ValidatedResponse.class, response.getBody());
+        assertFalse(body.isSuccess());
+        var reread = reread(t1);
+        assertEquals("Rita Recipient", reread.getFullName());
+        assertEquals("rita@example.org", reread.getEmail());
+    }
+
+    @Test
+    @DisplayName("[P9.R2] a locked ticket held by Rita answers a re-assign as today: 200, still Rita, her QR (no blanking)")
+    void p9_r2_lockedTicketIsNotBlanked() {
+        var t1 = createCompConfirmedUnassignedTicket();
+        var rita = assignRitaOk(t1);
+        assertEquals(1, ticketRepository.forbidReassignment(List.of(t1.getId())));
+
+        var answer = assignedAnswer(controller.assign(event.getShortName(), t1.getPublicUuid(), maxBody(), orgAKey));
+
+        var reread = reread(t1);
+        assertEquals("Rita Recipient", reread.getFullName());
+        assertEquals("rita@example.org", reread.getEmail());
+        assertAnswersTicket(answer, reread);
+        assertEquals(rita, answer);
     }
 
     // ---- P6: POST /qrush-ticket/{publicUuid}/reissue ----

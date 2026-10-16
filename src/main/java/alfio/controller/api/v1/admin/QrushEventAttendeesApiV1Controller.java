@@ -158,10 +158,10 @@ public class QrushEventAttendeesApiV1Controller {
     }
 
     @PutMapping("/{slug}/qrush-ticket/{publicUuid}/assign")
-    public ResponseEntity<ValidatedResponse<Boolean>> assign(@PathVariable String slug,
-                                                             @PathVariable UUID publicUuid,
-                                                             @RequestBody UpdateTicketOwnerForm form,
-                                                             Principal principal) {
+    public ResponseEntity<?> assign(@PathVariable String slug,
+                                    @PathVariable UUID publicUuid,
+                                    @RequestBody UpdateTicketOwnerForm form,
+                                    Principal principal) {
         accessService.checkEventOwnership(principal, slug);
         var event = eventManager.getSingleEvent(slug, principal.getName());
         var bindingResult = new BeanPropertyBindingResult(form, "updateTicketOwner");
@@ -219,4 +219,6 @@ public class QrushEventAttendeesApiV1Controller {
     public record QrushTicketSignature(int id, String signatureHash) {}
 
     public record QrushReissuedTicket(String publicUuid) {}
+
+    public record QrushAssignedTicket(String qrText, String signatureHash) {}
 }
