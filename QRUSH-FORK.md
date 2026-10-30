@@ -22,8 +22,10 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
 - P1 POST /api/v1/admin/reservation/{eventSlug}/{reservationId}/refund-void — full/partial void.
 - P2 GET  /api/v1/admin/reservation/{eventSlug}/{reservationId} — status + per-ticket detail
   (numeric id, internal and public uuid, assigned, checked-in, holder name, category id and name).
-  The internal uuid is the check-in identifier, so this endpoint stays org-key only and its answer
-  is never forwarded to a client. Overlaps upstream ReservationApiV1Controller#retrieveDetail (exists at the tag); kept because
+  The internal uuid is the check-in identifier and NO secret: it is the door row id (entryList doc
+  id) that every door phone and every door or ticket member reads. The QR signature is the secret.
+  Rule: no engine route may act on a ticket uuid alone; it needs the QR signature or an org key
+  (P11 refuses alf.io's public routes that do). This endpoint stays org-key only. Overlaps upstream ReservationApiV1Controller#retrieveDetail (exists at the tag); kept because
   retrieveDetail hides ticket resources for PENDING tickets and buries UUIDs in URI templates.
   Re-evaluate replacement at every rebase gate.
 - P3 GET  /api/v1/admin/event/{slug}/qrush-attendees (QrushEventAttendeesApiV1Controller, wave 2) —
@@ -46,14 +48,15 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
   W15) — the QR PNG of an assigned ticket of that event in a COMPLETE reservation,
   `Cache-Control: no-store`; the source of the CF's holder-checked QR callable instead of the
   public bearer-uuid code.png.
-- P8 `alfio.config.QrushPublicTicketAssignGuard` (W15, assumes D23) — servlet filter registered
-  after springSecurityFilterChain: `PUT /api/v2/public/event/{e}/ticket/{uuid}` answers 403 unless
-  the principal is an APITokenAuthentication holding ROLE_API_CLIENT. Upstream security config stays
-  untouched. Caddy refuses the same PUT once the CF assigns through P5.
+- P8 `alfio.config.QrushPublicTicketAssignGuard` (W15, assumes D23) — servlet filter on
+  `PUT /api/v2/public/event/{e}/ticket/{uuid}`. It admitted an org API key (ROLE_API_CLIENT) of ANY
+  org for any org's ticket; P11 replaces that with a refusal for every caller. Upstream security
+  config stays untouched. Caddy refuses the same PUT once the CF assigns through P5.
 - P9 (mail and sale run, wave 1) — three parts:
   - The P5 assign answers `{ qrText, signatureHash }`: qrText = the ticket's `ticketCode(event
-    private key, case flag)` (internal uuid + "/" + signature, the P7 PNG's text, so a secret like
-    P2's uuid), signatureHash = the P4 hash. Both come from the ticket RE-READ after the assign,
+    private key, case flag)` (internal uuid + "/" + signature, the P7 PNG's text; a secret because of
+    its signature, while the uuid half is the door row id and no secret, see P2), signatureHash =
+    the P4 hash. Both come from the ticket RE-READ after the assign,
     because TicketHelper hands back the ticket as loaded before the update.
   - The assign runs in ONE fork transaction (TransactionTemplate): fetchComplete first (404 as
     before), then, unless the ticket is locked (locked_assignment), fork SQL blanks email_address,
@@ -93,6 +96,34 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
   and answers that hold. RESET_TICKET clears ext_reference on release, void or expiry, so a voided or
   expired hold is replaced by a new one. Only this route takes the lock; waiters hold a pool
   connection for at most the lock timeout. P3 now emits `<orderId>:<i>` as externalReference.
+- P11 (security review 2026-10, C-D2-11 and the guard part of C-D2-10) — P8's
+  `QrushPublicTicketAssignGuard` refuses alf.io's public ticket and reservation routes for EVERY
+  caller (unkeyed, any org key, the system key, operator, supervisor, sponsor, an admin session)
+  and every method, including HEAD: an empty 403 written with setStatus, never sendError (an error
+  dispatch would run the security chain). It is ordered at `SecurityProperties.DEFAULT_FILTER_ORDER
+  - 1`, BEFORE springSecurityFilterChain and after the P9 allowlist. Otherwise an unkeyed PUT meets
+  the form chain's CSRF refusal first, which forwards to the unmapped `/session-expired` and ends as
+  404. Matching as in P9: context stripped, segments decoded, matrix parameters dropped, one trailing
+  slash ignored. Refused:
+  - Ticket routes (TicketApiV2Controller): `/api/v2/public/event/{e}/ticket/{t}` (GET, PUT, DELETE),
+    `…/full`, `…/code.png`, `/event/{e}/ticket/{t}/code.png`, `…/download-ticket`,
+    `…/send-ticket-by-email` and `…/code/{c}/check-in-info`.
+  - Online check-in (OnlineCheckInController): `/event/{e}/ticket/{publicUUID}/check-in/{hash}`.
+  - Reservation routes (ReservationApiV2Controller): `/api/v2/public/reservation/**`,
+    `/api/v2/public/event/{e}/reservation/{r}/receipt` and `/invoice`, and
+    `/api/v2/public/{type}/{id}/reservation/{r}/re-send-email`. alf.io has no v1 twin.
+  - Reservation creation: `POST /api/v2/public/event/{e}/reserve-tickets` (EventApiV2Controller).
+  - Pass and wallet downloads: `/api/pass/event/{e}/v1/version/passes/{ticketUuid}` and
+    `…/passes/{passTypeIdentifier}/{serialNumber}` (PassKitApiController), and
+    `/api/wallet/event/{e}/v1/version/passes/{uuid}` (GoogleWalletApiController).
+
+  No route stays open for a qrush caller: the CF client (qrush_cloud_functions
+  `functions/src/ticketing/alfioClient.ts`) calls only `/api/v1/admin/**` and
+  `/admin/api/check-in/**`, and the server gate (qrush_tickets `caddy/engine-gate.caddy`) forwards
+  only those and `/healthz`, so these routes were reachable only on loopback or the SSH tunnel.
+  The public event pages, ticket categories, subscriptions, polls, the SPA index pages and the
+  PassKit device no-ops stay as upstream. QrushPublicTicketAssignGuardChainTest runs the guard in
+  front of the real form chain and walks every mapping of the controllers above.
 - Box settings (precondition for P9 and P10, SYSTEM level, set by qrush_tickets' engine-settings
   script): SEND_TICKETS_AUTOMATICALLY=false (the engine never mails a ticket on assignment) and
   ASSIGNMENT_REMINDER_START=0 (no assignment reminder; pinned by QrushHoldApiV1ControllerTest
@@ -113,12 +144,13 @@ Deployed image: ghcr.io/qrushapp/alfio:qrush-2.0-M5-2606 (built by .github/workf
 2. New branch qrush/<new-tag> from the new tag; cherry-pick fork-owned files (additive => trivial).
 3. MANDATORY: full run of QrushReservationApiV1ControllerTest,
    QrushEventAttendeesApiV1ControllerTest, QrushPublicTicketAssignGuardTest,
-   QrushHoldApiV1ControllerTest, QrushProxiedRequestAllowlistTest AND QrushAssignMailTest (each with
+   QrushPublicTicketAssignGuardChainTest, QrushHoldApiV1ControllerTest,
+   QrushProxiedRequestAllowlistTest AND QrushAssignMailTest (each with
    -Dpgsql.version=16) — the cross-org tests (crossOrgKeyCannotRead/Void*, unknownSlug*,
    crossOrgKeyCannotReadForeignAttendees, crossOrgKeyCannotReadForeignSignatures,
    crossOrgKeyCannotAssignForeignTicket, crossOrgKeyCannotReissueForeignTicket,
-   crossOrgKeyCannotReadForeignTicketQr, the hold's [P10.4]), the guard suite, the proxy allowlist's
-   mapping walk [P9.13] and the no-mail assign [P9.5] must pass
+   crossOrgKeyCannotReadForeignTicketQr, the hold's [P10.4]), the guard suite with its mapping walk
+   [P11.7], the proxy allowlist's mapping walk [P9.13] and the no-mail assign [P9.5] must pass
    unmodified. A guard-signature change upstream fails compilation loudly; a behavior change
    fails these tests. Never relax them.
 4. Re-check the P2 overlap decision, CI pgsql matrix version, and Dockerfile drift.

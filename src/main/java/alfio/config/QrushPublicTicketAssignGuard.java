@@ -16,8 +16,6 @@
  */
 package alfio.config;
 
-import alfio.config.authentication.support.APITokenAuthentication;
-import alfio.model.user.Role;
 import jakarta.servlet.Filter;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -31,62 +29,69 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.server.PathContainer;
 import org.springframework.http.server.RequestPath;
-import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.util.pattern.PathPattern;
 import org.springframework.web.util.pattern.PathPatternParser;
 
 import java.io.IOException;
+import java.util.List;
+import java.util.stream.Stream;
 
 /**
- * qrush fork patch P8 — additive-only, see QRUSH-FORK.md.
- * The public ticket-assign PUT answers 403 unless the request carries an authenticated org API key
- * (ROLE_API_CLIENT on an APITokenAuthentication). Ordered after springSecurityFilterChain, so the
- * principal is already resolved when the guard runs.
+ * qrush fork patches P8 and P11 — additive-only, see QRUSH-FORK.md.
+ * alf.io's public ticket, reservation, online check-in, pass and wallet routes answer 403 for every
+ * caller and every method; qrush reaches tickets only through the org-key routes under /api/v1/admin/.
+ * Ordered before springSecurityFilterChain, so no CSRF refusal or redirect answers first.
  */
 @Configuration
 public class QrushPublicTicketAssignGuard {
 
-    private static final PathPattern PUBLIC_TICKET_ASSIGN =
-        PathPatternParser.defaultInstance.parse("/api/v2/public/event/{eventName}/ticket/{ticketIdentifier}");
+    private static final List<PathPattern> REFUSED_ROUTES = Stream.of(
+        "/api/v2/public/event/{eventName}/ticket/{ticketIdentifier}",
+        "/api/v2/public/event/{eventName}/ticket/{ticketIdentifier}/full",
+        "/api/v2/public/event/{eventName}/ticket/{ticketIdentifier}/code.png",
+        "/event/{eventName}/ticket/{ticketIdentifier}/code.png",
+        "/api/v2/public/event/{eventName}/ticket/{ticketIdentifier}/download-ticket",
+        "/api/v2/public/event/{eventName}/ticket/{ticketIdentifier}/send-ticket-by-email",
+        "/api/v2/public/event/{eventName}/ticket/{ticketIdentifier}/code/{checkInCode}/check-in-info",
+        "/event/{shortName}/ticket/{publicUUID}/check-in/{ticketCodeHash}",
+        "/api/v2/public/reservation/**",
+        "/api/v2/public/event/{eventName}/reservation/{reservationId}/receipt",
+        "/api/v2/public/event/{eventName}/reservation/{reservationId}/invoice",
+        "/api/v2/public/{purchaseContextType}/{publicIdentifier}/reservation/{reservationId}/re-send-email",
+        "/api/v2/public/event/{eventName}/reserve-tickets",
+        "/api/pass/event/{eventName}/v1/version/passes/{ticketUuid}",
+        "/api/pass/event/{eventName}/v1/version/passes/{passTypeIdentifier}/{serialNumber}",
+        "/api/wallet/event/{eventName}/v1/version/passes/{uuid}"
+    ).map(PathPatternParser.defaultInstance::parse).toList();
 
     // a bean named like this @Configuration class collides with it at boot
     @Bean
     public FilterRegistrationBean<Filter> qrushPublicTicketAssignGuardFilter() {
         Filter filter = QrushPublicTicketAssignGuard::guard;
         var registration = new FilterRegistrationBean<>(filter);
-        registration.setOrder(SecurityProperties.DEFAULT_FILTER_ORDER + 1);
+        registration.setOrder(SecurityProperties.DEFAULT_FILTER_ORDER - 1);
         return registration;
     }
 
-    static boolean isPublicTicketAssign(HttpServletRequest request) {
-        if (!"PUT".equals(request.getMethod())) {
-            return false;
-        }
+    static boolean isRefusedRoute(HttpServletRequest request) {
         // match the path MVC routes: context stripped, each segment decoded, matrix parameters dropped
         var path = RequestPath.parse(request.getRequestURI(), request.getContextPath()).pathWithinApplication();
-        if (PUBLIC_TICKET_ASSIGN.matches(path)) {
-            return true;
-        }
         var elements = path.elements();
-        return !elements.isEmpty()
-            && elements.get(elements.size() - 1) instanceof PathContainer.Separator
-            && PUBLIC_TICKET_ASSIGN.matches(path.subPath(0, elements.size() - 1));
-    }
-
-    static boolean isOrgApiKey() {
-        var authentication = SecurityContextHolder.getContext().getAuthentication();
-        return authentication instanceof APITokenAuthentication
-            && authentication.isAuthenticated()
-            && authentication.getAuthorities().stream()
-                .anyMatch(a -> Role.API_CONSUMER.getRoleName().equals(a.getAuthority()));
+        var withoutTrailingSlash = !elements.isEmpty() && elements.get(elements.size() - 1) instanceof PathContainer.Separator
+            ? path.subPath(0, elements.size() - 1)
+            : null;
+        return REFUSED_ROUTES.stream().anyMatch(route -> route.matches(path)
+            || (withoutTrailingSlash != null && route.matches(withoutTrailingSlash)));
     }
 
     private static void guard(ServletRequest request, ServletResponse response, FilterChain chain) throws IOException, ServletException {
         if (request instanceof HttpServletRequest httpRequest
             && response instanceof HttpServletResponse httpResponse
-            && isPublicTicketAssign(httpRequest)
-            && !isOrgApiKey()) {
-            httpResponse.sendError(HttpServletResponse.SC_FORBIDDEN);
+            && isRefusedRoute(httpRequest)) {
+            // setStatus, never sendError: an error dispatch would run the security chain and could answer otherwise
+            httpResponse.setStatus(HttpServletResponse.SC_FORBIDDEN);
+            httpResponse.setContentLength(0);
+            httpResponse.flushBuffer();
             return;
         }
         chain.doFilter(request, response);
